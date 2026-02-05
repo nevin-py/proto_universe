@@ -1,0 +1,34 @@
+# ProtoGalaxy Baseline Configuration
+# No Byzantine attacks
+
+fl:
+  num_rounds: 10
+  num_clients: 10
+  clients_per_round: 8
+  local_epochs: 5
+  local_batch_size: 32
+
+galaxy:
+  num_galaxies: 3
+  clients_per_galaxy: 3
+
+model:
+  type: "mnist_cnn"
+  learning_rate: 0.01
+  momentum: 0.9
+
+defense:
+  layer1_threshold: 2.0
+  layer2_threshold: 3.0
+  layer3_krum_f: 1
+  layer4_decay: 0.9
+
+storage:
+  persist_gradients: false
+  persist_models: true
+  output_dir: "outputs/baseline"
+
+simulation:
+  byzantine_clients: 0
+  attack_type: "none"
+  seed: 42
