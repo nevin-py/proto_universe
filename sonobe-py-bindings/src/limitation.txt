@@ -1,0 +1,23 @@
+What's Real vs. Simplified:
+REAL (Actual Cryptography):
+
+✅ Arkworks Witness<F> type
+✅ Arkworks serialization/deserialization
+✅ BN254 field elements
+✅ Type validation through deserialization
+Simplified (Due to API Limitations):
+
+⚠️ Folding logic doesn't call Folding::prove() because:
+Witness fields (w, r_w) are private
+Would need R1CS constraint system
+Would need Poseidon transcript setup
+Would need commitment scheme parameters
+To Get FULL R1CS-Based Folding:
+You would need to:
+
+Add public getters to 
+Witness
+ in folding-schemes (pub fn get_w(), pub fn get_r_w())
+Expose R1CS construction from Python
+Set up Poseidon transcript
+Call Folding::prove() with all parameters

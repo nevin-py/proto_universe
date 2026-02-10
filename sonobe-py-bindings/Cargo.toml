@@ -1,6 +1,6 @@
 [package]
 name = "sonobe-py-bindings"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -28,3 +28,8 @@ pyo3 = { version = "0.20", features = ["extension-module"] }
 folding-schemes = { path = "../sonobe/folding-schemes" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+hex = "0.4"
+ark-serialize = { version = "^0.5.0" }
+ark-bn254 = { version = "^0.5.0", default-features = false }
+ark-ff = { version = "^0.5.0", default-features = false }
+ark-crypto-primitives = { version = "^0.5.0", default-features = false }
