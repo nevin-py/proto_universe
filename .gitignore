@@ -42,3 +42,16 @@ experiments/results/
 # OS
 .DS_Store
 .env
+
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock
+
+# PyO3 / Maturin
+.maturin/
+*.so
+*.pyd
+*.dll
+*.dylib
