@@ -2,14 +2,18 @@
 
 Coordinates all defense layers in sequence:
 - Layer 1: Cryptographic integrity (Merkle verification)
-- Layer 2: Statistical anomaly detection
+- Layer 2: Statistical anomaly detection (3-metric analyzer)
 - Layer 3: Byzantine-robust aggregation (Trimmed Mean or Multi-Krum)
 - Layer 4: Reputation-based filtering
 """
 
-from typing import Optional
+from typing import Optional, Dict, List
 
-from src.defense.statistical import StatisticalDefenseLayer1, StatisticalDefenseLayer2
+from src.defense.statistical import (
+    StatisticalDefenseLayer1, 
+    StatisticalDefenseLayer2,
+    StatisticalAnalyzer
+)
 from src.defense.robust_agg import TrimmedMeanAggregator, MultiKrumAggregator
 from src.defense.reputation import ReputationManager
 
@@ -36,6 +40,7 @@ class DefenseCoordinator:
                 - layer3_trim_ratio: Trim ratio for Trimmed Mean (default 0.1)
                 - layer3_krum_f: Byzantine tolerance for Krum
                 - layer4_decay: Reputation decay factor
+                - use_full_analyzer: Use 3-metric StatisticalAnalyzer (PROTO-302)
         """
         self.num_clients = num_clients
         self.num_galaxies = num_galaxies
@@ -45,22 +50,35 @@ class DefenseCoordinator:
             config = {}
         
         self.config = {
-            'layer1_threshold': config.get('layer1_threshold', 2.0),
+            'layer1_threshold': config.get('layer1_threshold', 3.0),
             'layer2_threshold': config.get('layer2_threshold', 3.0),
             'layer3_method': config.get('layer3_method', self.AGGREGATOR_TRIMMED_MEAN),
             'layer3_trim_ratio': config.get('layer3_trim_ratio', 0.1),
             'layer3_krum_f': config.get('layer3_krum_f', 1),
             'layer3_krum_m': config.get('layer3_krum_m', 1),
             'layer4_decay': config.get('layer4_decay', 0.9),
+            'use_full_analyzer': config.get('use_full_analyzer', True),
+            'cosine_threshold': config.get('cosine_threshold', 0.5),
         }
         
         # Initialize layers
-        self.layer1 = StatisticalDefenseLayer1(
-            threshold=self.config['layer1_threshold']
-        )
-        self.layer2 = StatisticalDefenseLayer2(
-            threshold=self.config['layer2_threshold']
-        )
+        # Use the full 3-metric analyzer if configured (PROTO-302 compliant)
+        self.use_full_analyzer = self.config['use_full_analyzer']
+        
+        if self.use_full_analyzer:
+            self.statistical_analyzer = StatisticalAnalyzer(
+                norm_threshold_sigma=self.config['layer1_threshold'],
+                cosine_threshold=self.config['cosine_threshold'],
+                coordinate_threshold_sigma=self.config['layer2_threshold']
+            )
+        else:
+            # Legacy: separate Layer 1 and Layer 2
+            self.layer1 = StatisticalDefenseLayer1(
+                threshold=self.config['layer1_threshold']
+            )
+            self.layer2 = StatisticalDefenseLayer2(
+                norm_threshold_sigma=self.config['layer2_threshold']
+            )
         
         # Layer 3: Select aggregation method
         if self.config['layer3_method'] == self.AGGREGATOR_MULTI_KRUM:
@@ -98,16 +116,25 @@ class DefenseCoordinator:
             'cleaned_updates': updates
         }
         
-        # Layer 1: Statistical z-score detection
-        layer1_anomalies = self.layer1.detect_anomalies(updates)
-        results['layer1_detections'] = layer1_anomalies
-        
-        # Layer 2: Multi-dimensional norm detection
-        layer2_anomalies = self.layer2.detect_anomalies(updates)
-        results['layer2_detections'] = layer2_anomalies
-        
-        # Combine detections from statistical layers
-        all_anomalies = set(layer1_anomalies + layer2_anomalies)
+        # Layer 1 & 2: Statistical detection
+        if self.use_full_analyzer:
+            # Use 3-metric analyzer (PROTO-302 compliant)
+            analysis = self.statistical_analyzer.analyze(updates)
+            results['layer1_detections'] = analysis.get('norm_outliers', [])
+            results['layer2_detections'] = analysis.get('direction_outliers', [])
+            results['coordinate_outliers'] = analysis.get('coordinate_outliers', [])
+            results['statistical_flagged'] = analysis.get('flagged_clients', [])
+            results['failure_counts'] = analysis.get('failure_counts', {})
+            all_anomalies = set(analysis.get('flagged_indices', []))
+        else:
+            # Legacy: separate Layer 1 and Layer 2
+            layer1_anomalies = self.layer1.detect_anomalies(updates)
+            results['layer1_detections'] = layer1_anomalies
+            
+            layer2_anomalies = self.layer2.detect_anomalies(updates)
+            results['layer2_detections'] = layer2_anomalies
+            
+            all_anomalies = set(layer1_anomalies + layer2_anomalies)
         
         # Penalize detected clients in Layer 4 (reputation)
         for idx in all_anomalies:
