@@ -5,9 +5,11 @@ Coordinates all defense layers in sequence:
 - Layer 2: Statistical anomaly detection (3-metric analyzer)
 - Layer 3: Byzantine-robust aggregation (Trimmed Mean or Multi-Krum)
 - Layer 4: Reputation-based filtering
+- Layer 5: Galaxy-level defense (Architecture Section 4.5)
 """
 
 from typing import Optional, Dict, List
+import torch
 
 from src.defense.statistical import (
     StatisticalDefenseLayer1, 
@@ -16,6 +18,8 @@ from src.defense.statistical import (
 )
 from src.defense.robust_agg import TrimmedMeanAggregator, MultiKrumAggregator
 from src.defense.reputation import ReputationManager
+from src.defense.layer5_galaxy import Layer5GalaxyDefense
+from src.storage.forensic_logger import ForensicLogger
 
 
 class DefenseCoordinator:
@@ -94,6 +98,21 @@ class DefenseCoordinator:
         self.layer4 = ReputationManager(
             num_clients, 
             decay_factor=self.config['layer4_decay']
+        )
+        
+        # Layer 5: Galaxy-level defense (Architecture Section 4.5)
+        self.layer5 = Layer5GalaxyDefense(
+            num_galaxies=num_galaxies,
+            galaxy_rep_decay=self.config.get('layer5_galaxy_decay', 0.9),
+            norm_threshold=self.config.get('layer5_norm_threshold', 3.0),
+            direction_threshold=self.config.get('layer5_direction_threshold', 0.5),
+            consistency_threshold=self.config.get('layer5_consistency_threshold', 0.7),
+            dissolution_streak=self.config.get('layer5_dissolution_streak', 3)
+        )
+        
+        # Forensic logger for quarantine/ban evidence (Architecture Section 3.3, 4.4)
+        self.forensic_logger = ForensicLogger(
+            storage_dir=config.get('forensic_storage_dir', './forensic_evidence')
         )
         
         self.detection_results = []
@@ -199,6 +218,7 @@ class DefenseCoordinator:
                 suspicious.append((cid, rep))
         return sorted(suspicious, key=lambda x: x[1])
     
+    
     def set_aggregation_method(self, method: str, **kwargs):
         """Switch aggregation method.
         
@@ -217,3 +237,87 @@ class DefenseCoordinator:
             self.config['layer3_method'] = method
         else:
             raise ValueError(f"Unknown aggregation method: {method}")
+    
+    def run_galaxy_defense(
+        self,
+        galaxy_updates: Dict[int, List[torch.Tensor]],
+        client_assignments: Dict[int, int],
+        round_number: int
+    ) -> Dict:
+        """Run Layer 5: Galaxy-level defense (Architecture Section 4.5)
+        
+        Args:
+            galaxy_updates: Dict mapping galaxy_id -> aggregated gradients
+            client_assignments: Client-to-galaxy mapping
+            round_number: Current FL round
+            
+        Returns:
+            Layer 5 defense results with anomaly reports and isolation decisions
+        """
+        client_reputations = self.layer4.get_all_reputations()
+        
+        # Run Layer 5 defense
+        layer5_results = self.layer5.run_defense(
+            galaxy_updates=galaxy_updates,
+            client_assignments=client_assignments,
+            client_reputations=client_reputations
+        )
+        
+        # Log quarantine/ban decisions for flagged galaxies
+        for galaxy_id in layer5_results['flagged_galaxies']:
+            anomaly_report = layer5_results['anomaly_reports'][galaxy_id]
+            
+            # Get clients in this galaxy
+            galaxy_clients = [
+                cid for cid, gid in client_assignments.items()
+                if gid == galaxy_id
+            ]
+            
+            # Log evidence for each low-reputation client
+            for client_id in galaxy_clients:
+                rep = client_reputations.get(client_id, 1.0)
+                
+                if self.layer4.is_quarantined(client_id):
+                    # Log quarantine with galaxy-level evidence
+                    self.forensic_logger.log_quarantine(
+                        client_id=client_id,
+                        round_number=round_number,
+                        commitment_hash="",  # To be filled by pipeline
+                        merkle_proof=[],  # To be filled by pipeline
+                        merkle_root="",  # To be filled by pipeline
+                        layer_results={
+                            'layer1_failed': False,
+                            'layer2_flags': [],
+                            'layer3_rejected': False,
+                            'layer4_reputation': rep,
+                            'layer5_galaxy_flagged': True,
+                            'layer5_failed_checks': anomaly_report.failed_checks
+                        },
+                        metadata={
+                            'galaxy_id': galaxy_id,
+                            'galaxy_norm_deviation': anomaly_report.norm_deviation_score,
+                            'galaxy_direction_similarity': anomaly_report.direction_similarity,
+                            'galaxy_consistency': anomaly_report.cross_galaxy_consistency
+                        }
+                    )
+                elif self.layer4.is_banned(client_id):
+                    # Log permanent ban
+                    self.forensic_logger.log_ban(
+                        client_id=client_id,
+                        round_number=round_number,
+                        commitment_hash="",
+                        merkle_proof=[],
+                        merkle_root="",
+                        layer_results={
+                            'layer1_failed': False,
+                            'layer2_flags': [],
+                            'layer3_rejected': False,
+                            'layer4_reputation': rep,
+                            'layer5_galaxy_flagged': True,
+                            'layer5_failed_checks': anomaly_report.failed_checks
+                        },
+                        metadata={'galaxy_id': galaxy_id}
+                    )
+        
+        return layer5_results
+
