@@ -4,6 +4,7 @@ Provides:
 - FL Coordinator for round management
 - Round Manager for phase tracking
 - Model Synchronizer for model distribution (PROTO-1104)
+- ProtoGalaxy Pipeline for end-to-end FL execution
 """
 
 from src.orchestration.coordinator import FLCoordinator
@@ -20,6 +21,11 @@ from src.orchestration.model_sync import (
     compute_model_hash,
     compute_state_dict_hash
 )
+from src.orchestration.pipeline import (
+    ProtoGalaxyPipeline,
+    ClientSubmission,
+    GalaxySubmission
+)
 
 __all__ = [
     'FLCoordinator',
@@ -32,5 +38,9 @@ __all__ = [
     'ModelVersion',
     'ClientModelReceiver',
     'compute_model_hash',
-    'compute_state_dict_hash'
+    'compute_state_dict_hash',
+    # Complete ProtoGalaxy pipeline
+    'ProtoGalaxyPipeline',
+    'ClientSubmission',
+    'GalaxySubmission'
 ]

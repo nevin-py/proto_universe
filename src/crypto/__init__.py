@@ -4,6 +4,7 @@ This module provides cryptographic primitives for:
 - Gradient commitment and verification (Merkle trees)
 - Hash functions and secure random generation (PROTO-1003)
 - Proof verification utilities
+- Pipeline adapters for easy integration
 """
 
 from .merkle import (
@@ -15,6 +16,11 @@ from .merkle import (
     verify_proof,
     combine_hashes,
     serialize_gradient,
+)
+
+from .merkle_adapter import (
+    GalaxyMerkleTreeAdapter,
+    GlobalMerkleTreeAdapter
 )
 
 from .utils import (
@@ -39,6 +45,9 @@ __all__ = [
     'GalaxyMerkleTree', 
     'GlobalMerkleTree',
     'GradientCommitment',
+    # Merkle tree adapters (pipeline integration)
+    'GalaxyMerkleTreeAdapter',
+    'GlobalMerkleTreeAdapter',
     # Hash functions
     'compute_hash',
     'verify_proof',
