@@ -28,6 +28,7 @@ from src.client.verifier import ProofVerifier
 from src.crypto.merkle_adapter import GalaxyMerkleTreeAdapter, GlobalMerkleTreeAdapter
 from src.crypto.utils import generate_timestamp, generate_nonce_hex
 from src.crypto.merkle import compute_hash
+from src.crypto.zkp_prover import GradientSumCheckProver, GalaxyProofFolder, ZKProof
 from src.defense.coordinator import DefenseCoordinator
 from src.defense.statistical import StatisticalAnalyzer
 from src.aggregators.galaxy import GalaxyAggregator
@@ -158,6 +159,14 @@ class ProtoGalaxyPipeline:
             for cid in range(num_clients)
         }
         self.proof_verifier = ProofVerifier()
+        
+        # ZKP infrastructure (Architecture Section 3.3 + 4.1)
+        # Proves gradient sum correctness via ProtoGalaxy IVC folding.
+        # Falls back to SHA-256 commitments if Rust module unavailable.
+        self.zkp_prover = GradientSumCheckProver()
+        self.galaxy_proof_folder = GalaxyProofFolder()
+        self.client_zk_proofs: Dict[int, ZKProof] = {}   # client_id -> ZKProof
+        self.galaxy_zk_proofs: Dict[int, ZKProof] = {}    # galaxy_id -> folded ZKProof
         
         # Storage for current round
         self.round_commitments: Dict[int, Dict[int, str]] = {}  # galaxy_id -> {client_id -> hash}
@@ -303,6 +312,51 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
+    def phase1_generate_zk_proofs(
+        self,
+        client_gradients: Dict[int, List[torch.Tensor]],
+        round_number: int
+    ) -> Dict[str, Any]:
+        """
+        Phase 1: Generate ZK sum-check proofs for all clients.
+        
+        Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
+          z_0 = 0  →  z_1 = z_0 + sum(layer_0)  →  ...  →  z_n = total_sum
+        
+        The proof is constant-size and verifiable in O(1).
+        Architecture Section 3.3 — Commitment Generator + ZK verification.
+        
+        Args:
+            client_gradients: Dict mapping client_id → List[torch.Tensor]
+            round_number: Current FL round
+            
+        Returns:
+            Dict with ZK metrics (proofs_generated, prove_time_ms, mode)
+        """
+        self.client_zk_proofs = {}  # Reset for this round
+        zk_total_time_ms = 0.0
+        
+        for client_id, grads in client_gradients.items():
+            zk_proof = self.zkp_prover.prove_gradient_sum(
+                gradients=grads,
+                client_id=client_id,
+                round_number=round_number,
+            )
+            self.client_zk_proofs[client_id] = zk_proof
+            zk_total_time_ms += zk_proof.prove_time_ms
+        
+        num_proofs = len(self.client_zk_proofs)
+        mode = "REAL (ProtoGalaxy IVC)" if (
+            num_proofs > 0 and next(iter(self.client_zk_proofs.values())).is_real
+        ) else "FALLBACK (SHA-256)"
+        
+        return {
+            'proofs_generated': num_proofs,
+            'prove_time_ms': zk_total_time_ms,
+            'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
+            'mode': mode,
+        }
+    
     # =========================================================================
     # Phase 2: Revelation Phase
     # =========================================================================
@@ -385,6 +439,20 @@ class ProtoGalaxyPipeline:
                     self.logger.warning(f"No commitment found for client {client_id}")
                 continue
             
+            # ── Replay attack prevention (Architecture Section 4.1) ──
+            # Verify that the submitted round number matches the current
+            # round.  This prevents a valid commitment from round N being
+            # replayed in round N+1.
+            submitted_round = submission.metadata.get('round_number')
+            if submitted_round is not None and submitted_round != submission.round_number:
+                rejected_clients.append(client_id)
+                if self.logger:
+                    self.logger.warning(
+                        f"Replay attack detected for client {client_id}: "
+                        f"metadata round {submitted_round} != submission round {submission.round_number}"
+                    )
+                continue
+            
             # Verify Merkle proof using ProofVerifier
             proof = merkle_tree.get_proof(client_id)
             root = merkle_tree.get_root()
@@ -403,20 +471,17 @@ class ProtoGalaxyPipeline:
                     self.logger.warning(f"Invalid Merkle proof for client {client_id}")
                 continue
             
-            # ============================================================
-            # Gap 2: Trust-weighted aggregation (Architecture Section 4.4)
-            # Weight gradients by reputation: w_bar = Sum(R_i * grad_i) / Sum(R_i)
-            # Apply reputation weight before passing to aggregation.
-            # ============================================================
+            # Store verified submission with raw gradients.
+            # Trust-weighted aggregation (Architecture Section 4.4) is applied
+            # AFTER defense filtering in Phase 3, not here, so that the
+            # statistical analyzer and robust aggregator see unweighted
+            # gradients and can apply their thresholds correctly.
             reputation = defense_coordinator.layer4.get_reputation(client_id)
-            weighted_gradients = []
-            for g in submission.gradients:
-                weighted_gradients.append(g * reputation)
             
-            # Store verified submission with weighted gradients
+            # Store verified submission with raw gradients
             verified_updates.append({
                 'client_id': client_id,
-                'gradients': weighted_gradients,
+                'gradients': submission.gradients,
                 'metadata': submission.metadata,
                 'reputation': reputation
             })
@@ -431,6 +496,64 @@ class ProtoGalaxyPipeline:
             })
         
         return verified_updates, rejected_clients
+    
+    def phase2_verify_zk_proofs(
+        self,
+        verified_client_ids: List[int]
+    ) -> Dict[str, Any]:
+        """
+        Phase 2: Verify ZK sum-check proofs for Merkle-verified clients.
+        
+        Clients that passed Merkle verification in Phase 2 are additionally
+        checked for valid ZK sum-check proofs (Architecture Section 4.1).
+        Invalid ZK proofs cause rejection.
+        
+        Args:
+            verified_client_ids: Client IDs that passed Merkle verification
+            
+        Returns:
+            Dict with zk_verified count, zk_failed count, rejected IDs, 
+            verify_time_ms, and mode
+        """
+        if not self.client_zk_proofs:
+            return {
+                'zk_verified': 0,
+                'zk_failed': 0,
+                'zk_rejected_ids': [],
+                'verify_time_ms': 0.0,
+                'mode': 'NONE',
+            }
+        
+        zk_start = time.time()
+        zk_verified = 0
+        zk_failed = 0
+        zk_rejected_ids = []
+        
+        for client_id in verified_client_ids:
+            zk_proof = self.client_zk_proofs.get(client_id)
+            if zk_proof is None:
+                continue  # No ZK proof for this client (shouldn't happen)
+            
+            is_valid = GradientSumCheckProver.verify_proof(zk_proof)
+            if is_valid:
+                zk_verified += 1
+            else:
+                zk_failed += 1
+                zk_rejected_ids.append(client_id)
+        
+        zk_verify_time_ms = (time.time() - zk_start) * 1000
+        mode = "REAL" if (
+            self.client_zk_proofs
+            and next(iter(self.client_zk_proofs.values())).is_real
+        ) else "FALLBACK"
+        
+        return {
+            'zk_verified': zk_verified,
+            'zk_failed': zk_failed,
+            'zk_rejected_ids': zk_rejected_ids,
+            'verify_time_ms': zk_verify_time_ms,
+            'mode': mode,
+        }
     
     # =========================================================================
     # Phase 3: Multi-Layer Defense
@@ -487,6 +610,46 @@ class ProtoGalaxyPipeline:
                 aggregated_gradients = flat_grads
         else:
             aggregated_gradients = agg_raw
+        
+        # ================================================================
+        # Trust-Weighted Aggregation (Architecture Section 4.4)
+        # w̄ = Σ(Rᵢ · ∇wᵢ) / Σ(Rᵢ)
+        # Applied AFTER defense filtering so that the statistical analyzer
+        # and robust aggregator operate on unweighted gradients.
+        # ================================================================
+        reputation_sum = sum(
+            u.get('reputation', 0.5) for u in verified_updates
+        )
+        if reputation_sum > 0 and aggregated_gradients is not None:
+            # The aggregator already averaged the gradients.  To retroactively
+            # apply trust-weighted averaging we compute a per-client weighted
+            # mean ourselves from the cleaned updates that the aggregator used.
+            cleaned = defense_result.get('cleaned_updates', verified_updates)
+            if len(cleaned) > 1:
+                rep_weights = []
+                for u in cleaned:
+                    # Retrieve the reputation stored during Phase 2
+                    rep_weights.append(u.get('reputation', 0.5))
+                total_rep = sum(rep_weights)
+                if total_rep > 0:
+                    # Recompute weighted average from cleaned updates
+                    first_grads = cleaned[0]['gradients']
+                    weighted_agg = [
+                        torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                        else np.zeros_like(np.asarray(g))
+                        for g in first_grads
+                    ]
+                    for u, w in zip(cleaned, rep_weights):
+                        for li, g in enumerate(u['gradients']):
+                            if isinstance(g, torch.Tensor):
+                                weighted_agg[li] = weighted_agg[li] + g * (w / total_rep)
+                            else:
+                                weighted_agg[li] = weighted_agg[li] + np.asarray(g) * (w / total_rep)
+                    # Convert everything to tensors
+                    aggregated_gradients = [
+                        torch.tensor(g, dtype=torch.float32) if not isinstance(g, torch.Tensor) else g
+                        for g in weighted_agg
+                    ]
         
         # Get flagged clients
         flagged_clients = list(set(
@@ -737,6 +900,59 @@ class ProtoGalaxyPipeline:
         if self.logger:
             self.logger.info(f"Global model updated for round {self.current_round}")
     
+    def phase4_fold_galaxy_zk_proofs(
+        self,
+        clean_galaxy_ids: List[int]
+    ) -> Dict[str, Any]:
+        """
+        Phase 4: Fold per-client ZK proofs into per-galaxy proofs.
+        
+        Uses ProtoGalaxy's IVC property to fold N client proofs into 1 constant-size
+        galaxy proof (Architecture Section 3.2 — Multi-Level Merkle + ZK).
+        
+        Args:
+            clean_galaxy_ids: List of galaxy IDs that passed defense (non-flagged)
+            
+        Returns:
+            Dict with folding metrics (galaxies_folded, folding_time_ms, mode)
+        """
+        self.galaxy_zk_proofs = {}
+        
+        if not self.client_zk_proofs:
+            return {
+                'galaxies_folded': 0,
+                'folding_time_ms': 0.0,
+                'mode': 'NONE',
+            }
+        
+        fold_start = time.time()
+        
+        for galaxy_id in clean_galaxy_ids:
+            galaxy_client_ids = self.galaxy_assignments.get(galaxy_id, [])
+            galaxy_proofs = [
+                self.client_zk_proofs[cid]
+                for cid in galaxy_client_ids
+                if cid in self.client_zk_proofs
+            ]
+            
+            if galaxy_proofs:
+                folded = self.galaxy_proof_folder.fold_galaxy_proofs(
+                    galaxy_proofs, galaxy_id
+                )
+                self.galaxy_zk_proofs[galaxy_id] = folded
+        
+        folding_time_ms = (time.time() - fold_start) * 1000
+        mode = "REAL" if (
+            self.galaxy_zk_proofs
+            and next(iter(self.galaxy_zk_proofs.values())).is_real
+        ) else "FALLBACK"
+        
+        return {
+            'galaxies_folded': len(self.galaxy_zk_proofs),
+            'folding_time_ms': folding_time_ms,
+            'mode': mode,
+        }
+    
     def phase4_distribute_model(self) -> Dict:
         """
         Phase 4: Distribute updated global model to all clients.
@@ -814,6 +1030,11 @@ class ProtoGalaxyPipeline:
         # Step 1c: Global builds Merkle tree
         global_root = self.phase1_global_collect_galaxy_roots(galaxy_roots)
         
+        # Step 1d: Generate ZK sum-check proofs for all clients
+        zk_prove_metrics = self.phase1_generate_zk_proofs(
+            client_gradients, round_number
+        )
+        
         # =========================
         # PHASE 2: REVELATION
         # =========================
@@ -844,6 +1065,30 @@ class ProtoGalaxyPipeline:
             )
             galaxy_verified_updates[galaxy_id] = verified
             galaxy_rejected_clients[galaxy_id] = rejected
+        
+        # Step 2c: Verify ZK sum-check proofs for Merkle-verified clients
+        all_verified_ids = [
+            u['client_id']
+            for updates in galaxy_verified_updates.values()
+            for u in updates
+        ]
+        zk_verify_metrics = self.phase2_verify_zk_proofs(all_verified_ids)
+        
+        # Remove ZK-rejected clients from verified updates
+        if zk_verify_metrics['zk_rejected_ids']:
+            zk_reject_set = set(zk_verify_metrics['zk_rejected_ids'])
+            for galaxy_id in galaxy_verified_updates:
+                original = galaxy_verified_updates[galaxy_id]
+                galaxy_verified_updates[galaxy_id] = [
+                    u for u in original if u['client_id'] not in zk_reject_set
+                ]
+                newly_rejected = [
+                    u['client_id'] for u in original
+                    if u['client_id'] in zk_reject_set
+                ]
+                galaxy_rejected_clients[galaxy_id] = (
+                    galaxy_rejected_clients.get(galaxy_id, []) + newly_rejected
+                )
         
         # =========================
         # PHASE 3: DEFENSE
@@ -888,7 +1133,17 @@ class ProtoGalaxyPipeline:
         # Step 4d: Update global model
         self.phase4_update_global_model(global_gradients)
         
-        # Step 4e: Distribute model
+        # Step 4e: Fold ZK proofs per galaxy (non-flagged galaxies only)
+        clean_galaxy_ids = [
+            u['galaxy_id'] for u in verified_galaxies
+            if u['galaxy_id'] not in set(
+                global_defense_report.get('flagged_galaxies', [])
+                + global_defense_report.get('layer5_flagged_galaxies', [])
+            )
+        ]
+        zk_fold_metrics = self.phase4_fold_galaxy_zk_proofs(clean_galaxy_ids)
+        
+        # Step 4f: Distribute model
         sync_package = self.phase4_distribute_model()
         
         # =========================
@@ -908,7 +1163,11 @@ class ProtoGalaxyPipeline:
             'layer5_flagged': global_defense_report.get('layer5_flagged_galaxies', []),
             'layer5_dissolutions': global_defense_report.get('layer5_dissolutions', []),
             'model_hash': sync_package['model_hash'],
-            'round_time': round_time
+            'round_time': round_time,
+            # ZKP metrics
+            'zk_prove': zk_prove_metrics,
+            'zk_verify': zk_verify_metrics,
+            'zk_fold': zk_fold_metrics,
         }
         
         self.round_stats.append(round_stats)

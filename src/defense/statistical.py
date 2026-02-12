@@ -136,28 +136,36 @@ class StatisticalAnalyzer:
     def _detect_norm_deviation(self, flattened: np.ndarray) -> List[int]:
         """
         Metric 1: Detect gradients with abnormal L2 norms.
-        Flags gradients whose norm deviates > threshold_sigma from mean.
+        
+        Uses **median + MAD** (Median Absolute Deviation) instead of
+        mean + std so that the reference statistic is not corrupted
+        when a significant fraction of clients are Byzantine.
         """
         norms = np.linalg.norm(flattened, axis=1)
-        mean_norm = np.mean(norms)
-        std_norm = np.std(norms)
+        median_norm = np.median(norms)
+        mad = np.median(np.abs(norms - median_norm))
+        # Convert MAD to a std-like scale (for Gaussian: std ≈ 1.4826 * MAD)
+        mad_std = 1.4826 * mad
         
-        if std_norm < 1e-8:
+        if mad_std < 1e-8:
             return []
         
-        z_scores = np.abs((norms - mean_norm) / std_norm)
+        z_scores = np.abs((norms - median_norm) / mad_std)
         outliers = np.where(z_scores > self.norm_threshold_sigma)[0].tolist()
         return outliers
     
     def _detect_direction_anomaly(self, flattened: np.ndarray) -> List[int]:
         """
         Metric 2: Detect gradients with abnormal direction (low cosine similarity).
-        Computes cosine similarity to mean gradient and flags those below threshold.
-        """
-        mean_gradient = np.mean(flattened, axis=0)
-        mean_norm = np.linalg.norm(mean_gradient)
         
-        if mean_norm < 1e-8:
+        Uses coordinate-wise **median** as the reference gradient instead
+        of the mean, so that Byzantine clients (even at -10× scale)
+        cannot flip the reference direction.
+        """
+        ref_gradient = np.median(flattened, axis=0)
+        ref_norm = np.linalg.norm(ref_gradient)
+        
+        if ref_norm < 1e-8:
             return []
         
         outliers = []
@@ -167,7 +175,7 @@ class StatisticalAnalyzer:
                 outliers.append(i)
                 continue
             
-            cosine_sim = np.dot(grad, mean_gradient) / (grad_norm * mean_norm)
+            cosine_sim = np.dot(grad, ref_gradient) / (grad_norm * ref_norm)
             if cosine_sim < self.cosine_threshold:
                 outliers.append(i)
         

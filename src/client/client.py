@@ -63,7 +63,8 @@ class Client:
         self,
         published_root: str,
         own_commitment_hash: str,
-        proof: list
+        proof: list,
+        leaf_index: int = 0
     ) -> bool:
         """Verify published Merkle root is consistent with own commitment.
         
@@ -74,14 +75,16 @@ class Client:
             published_root: The Merkle root published by the galaxy/global
             own_commitment_hash: This client's commitment hash (leaf)
             proof: Merkle proof path from leaf to root
+            leaf_index: Index of the leaf in the Merkle tree
             
         Returns:
             True if published root is consistent with commitment
         """
         return self.verifier.verify_proof(
-            leaf_hash=own_commitment_hash,
+            root=published_root,
             proof=proof,
-            root_hash=published_root
+            leaf_hash=own_commitment_hash,
+            leaf_index=leaf_index
         )
     
     def attack(self, attack_type: str, **kwargs):

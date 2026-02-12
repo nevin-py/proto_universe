@@ -78,8 +78,8 @@ class EnhancedReputationManager:
         self.ban_threshold = ban_threshold
         self.rehabilitation_rounds = rehabilitation_rounds
         
-        # Reputation scores
-        self.reputation_scores = {i: 1.0 for i in range(num_clients)}
+        # Architecture Section 4.4: "Initialize: R_i(0) = 0.5 (neutral)"
+        self.reputation_scores = {i: 0.5 for i in range(num_clients)}
         
         # Client statuses
         self.client_status: Dict[int, ClientStatus] = {
@@ -96,10 +96,10 @@ class EnhancedReputationManager:
         # Per-layer indicators (for behavior scoring)
         self.layer_indicators: Dict[int, Dict[str, float]] = {
             i: {
-                'integrity': 1.0,
-                'statistical': 1.0,
-                'krum': 1.0,
-                'historical': 1.0
+                'integrity': 0.5,
+                'statistical': 0.5,
+                'krum': 0.5,
+                'historical': 0.5
             } for i in range(num_clients)
         }
         
@@ -121,10 +121,10 @@ class EnhancedReputationManager:
         """
         # Update per-layer indicators (EWMA)
         indicators = self.layer_indicators.get(client_id, {
-            'integrity': 1.0,
-            'statistical': 1.0,
-            'krum': 1.0,
-            'historical': 1.0
+            'integrity': 0.5,
+            'statistical': 0.5,
+            'krum': 0.5,
+            'historical': 0.5
         })
         
         # Layer 1: Integrity
@@ -149,7 +149,7 @@ class EnhancedReputationManager:
         )
         
         # Layer 4: Historical (current reputation)
-        indicators['historical'] = self.reputation_scores.get(client_id, 1.0)
+        indicators['historical'] = self.reputation_scores.get(client_id, 0.5)
         
         self.layer_indicators[client_id] = indicators
         
@@ -162,18 +162,23 @@ class EnhancedReputationManager:
         )
         new_score = behavior.compute_weighted_score()
         
-        # Update reputation
-        old_score = self.reputation_scores.get(client_id, 1.0)
-        self.reputation_scores[client_id] = new_score
+        # Architecture Section 4.4: "R(t+1) = (1-λ)·R(t) + λ·B(t), λ = 0.1"
+        # Apply EWMA at the top-level reputation score so that reputation
+        # changes gradually rather than being directly overwritten.
+        lambda_lr = 1.0 - self.decay_factor  # decay_factor = 0.9 → λ = 0.1
+        old_score = self.reputation_scores.get(client_id, 0.5)
+        smoothed_score = (1.0 - lambda_lr) * old_score + lambda_lr * new_score
+        self.reputation_scores[client_id] = smoothed_score
         
         # Check for status changes
-        self._update_client_status(client_id, new_score, round_number)
+        self._update_client_status(client_id, smoothed_score, round_number)
         
         self.history.append({
             'round': round_number,
             'client_id': client_id,
             'old_score': old_score,
-            'new_score': new_score,
+            'new_score': smoothed_score,
+            'behavior_score': new_score,
             'status': self.client_status[client_id].value,
             'layer_results': layer_results.copy()
         })
@@ -239,7 +244,7 @@ class EnhancedReputationManager:
     
     def get_reputation(self, client_id: int) -> float:
         """Get reputation score for a client"""
-        return self.reputation_scores.get(client_id, 1.0)
+        return self.reputation_scores.get(client_id, 0.5)
     
     def get_all_reputations(self) -> Dict[int, float]:
         """Get all reputation scores"""
@@ -303,7 +308,7 @@ class EnhancedReputationManager:
             client_id: Client to penalize
             penalty: Amount to reduce reputation
         """
-        current = self.reputation_scores.get(client_id, 1.0)
+        current = self.reputation_scores.get(client_id, 0.5)
         new_score = max(0.0, current - penalty)
         self.reputation_scores[client_id] = new_score
     
@@ -314,7 +319,7 @@ class EnhancedReputationManager:
             client_id: Client to reward
             reward: Amount to increase reputation
         """
-        current = self.reputation_scores.get(client_id, 1.0)
+        current = self.reputation_scores.get(client_id, 0.5)
         new_score = min(1.0, current + reward)
         self.reputation_scores[client_id] = new_score
     

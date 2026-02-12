@@ -268,3 +268,67 @@ class MultiKrumAggregator:
             List of client indices selected by Krum
         """
         return self.selected_indices
+
+
+class CoordinateWiseMedianAggregator:
+    """Layer 3: Coordinate-Wise Median robust aggregation.
+    
+    For each parameter dimension, takes the median across all clients.
+    This is optimal when up to half the clients can be Byzantine.
+    
+    Per architecture Section 4.3:
+        "Coordinate-wise median offers computational efficiency
+         with moderate threat tolerance."
+    
+    Complexity: O(n log n · d)  — same order as Trimmed Mean.
+    Byzantine tolerance: up to 50% malicious clients (strongest).
+    """
+    
+    def __init__(self):
+        self.original_shapes: list = []
+        self._last_n: int = 0
+    
+    def aggregate(self, updates: list) -> Optional[dict]:
+        """Perform coordinate-wise median aggregation.
+        
+        Args:
+            updates: List of update dicts with 'gradients' key
+            
+        Returns:
+            Dict with 'gradients' (aggregated) or None if empty
+        """
+        if not updates:
+            return None
+        
+        n = len(updates)
+        self._last_n = n
+        
+        # Flatten all gradients and record shapes
+        flattened = []
+        self.original_shapes = []
+        
+        for update in updates:
+            grads = update['gradients']
+            if not self.original_shapes:
+                for g in grads:
+                    if isinstance(g, torch.Tensor):
+                        self.original_shapes.append(g.shape)
+                    else:
+                        self.original_shapes.append(np.array(g).shape)
+            
+            flat = np.concatenate([
+                g.detach().cpu().numpy().flatten() if isinstance(g, torch.Tensor)
+                else np.array(g).flatten()
+                for g in grads
+            ])
+            flattened.append(flat)
+        
+        flattened = np.array(flattened)  # (n, d)
+        
+        # Coordinate-wise median
+        aggregated = np.median(flattened, axis=0).astype(np.float32)
+        
+        return {
+            'gradients': aggregated,
+            'method': 'coordinate_wise_median'
+        }

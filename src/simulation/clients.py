@@ -38,16 +38,33 @@ class HonestClientSimulator:
 class ByzantineClientSimulator:
     """Simulates Byzantine clients with various attack strategies"""
     
-    def __init__(self, client_id: int, model: torch.nn.Module, attack_type: str = "gradient_poison"):
-        """Initialize Byzantine client simulator"""
+    def __init__(self, client_id: int, model: torch.nn.Module,
+                 attack_type: str = "gradient_poison", data_loader=None):
+        """Initialize Byzantine client simulator.
+        
+        Args:
+            client_id: Client identifier
+            model: Model to train / poison
+            attack_type: Attack strategy name
+            data_loader: Real data loader so that attacks operate on
+                         genuine gradients (not zero vectors).
+        """
         self.client = Client(client_id, model, is_byzantine=True)
         self.attack_type = attack_type
+        self.data_loader = data_loader
         self.attack_history = []
     
     def simulate_round(self, num_epochs: int = 1):
-        """Simulate one round with attack"""
-        # Simulate training (or skip)
-        self.client.train_local(None, 0)  # No real training
+        """Simulate one round with attack.
+        
+        The client trains on real data first so that attack perturbations
+        are applied to genuine gradients rather than zero vectors.
+        """
+        # Train on real data so gradients are non-trivial
+        if self.data_loader is not None:
+            self.client.train_local(self.data_loader, num_epochs)
+        else:
+            self.client.train_local(None, 0)  # Legacy fallback
         
         # Apply attack
         self.client.attack(self.attack_type)
@@ -76,8 +93,11 @@ def create_client_simulators(num_clients: int, model: torch.nn.Module,
     
     for i in range(num_clients):
         if i < num_byzantine:
-            # Byzantine client
-            sim = ByzantineClientSimulator(i, model, attack_type)
+            # Byzantine client — still give it a data loader so attacks
+            # operate on real gradients
+            data_loader = data_loaders[i] if i < len(data_loaders) else None
+            sim = ByzantineClientSimulator(i, model, attack_type,
+                                           data_loader=data_loader)
         else:
             # Honest client
             data_loader = data_loaders[i] if i < len(data_loaders) else None

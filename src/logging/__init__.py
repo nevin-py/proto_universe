@@ -142,7 +142,9 @@ class FLLogger:
         event_type: str = "general",
         metrics: Optional[Dict] = None,
         client_id: Optional[str] = None,
-        galaxy_id: Optional[str] = None
+        galaxy_id: Optional[str] = None,
+        extra: Optional[Dict] = None,
+        **kwargs
     ) -> None:
         """Internal logging method.
         
@@ -153,10 +155,17 @@ class FLLogger:
             metrics: Optional metrics dict
             client_id: Optional client ID
             galaxy_id: Optional galaxy ID
+            extra: Optional dict of additional structured metadata
         """
+        # Merge extra into metrics so structured data is preserved
+        if extra:
+            if metrics is None:
+                metrics = {}
+            metrics.update(extra)
+        
         # Standard logging with round info
-        extra = {'round': self.current_round}
-        self.logger.log(level.value, message, extra=extra)
+        log_extra = {'round': self.current_round}
+        self.logger.log(level.value, message, extra=log_extra)
         
         # JSON structured log
         if hasattr(self, '_json_file') and self._json_file:

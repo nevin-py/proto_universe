@@ -181,7 +181,7 @@ class ProtoGalaxyOrchestrator:
         
         return round_result
     
-    def _phase1_commitment(self, client_commitments: Dict[int, str], client_gradients: Dict[int, List] = None) -> PhaseResult:
+    def _phase1_commitment(self, client_commitments: Dict[int, GradientCommitment], client_gradients: Optional[Dict[int, List]] = None) -> PhaseResult:
         """Phase 1: Build Merkle trees and generate ZK sum-check proofs.
         
         Args:
@@ -206,10 +206,10 @@ class ProtoGalaxyOrchestrator:
                 if client_id in client_commitments:
                     commitment_obj = client_commitments[client_id]
                     # Extract gradients from commitment object and flatten to tensor
-                    # commitment_obj.gradients is a dict of {param_name: tensor}
-                    grad_dict = commitment_obj.gradients
+                    # commitment_obj.gradients is a list of [torch.Tensor, ...]
+                    grad_list = commitment_obj.gradients
                     # Flatten all gradients to a single vector
-                    flat_grad = torch.cat([g.flatten() for g in grad_dict])
+                    flat_grad = torch.cat([g.flatten() for g in grad_list])
                     galaxy_gradients.append(flat_grad)
                     galaxy_client_ids.append(client_id)
             
@@ -284,7 +284,7 @@ class ProtoGalaxyOrchestrator:
     def _phase2_revelation(
         self,
         client_updates: Dict[int, torch.Tensor],
-        client_commitments: Dict[int, str],
+        client_commitments: Dict[int, GradientCommitment],
         client_proofs: Dict[int, List]
     ) -> PhaseResult:
         """Phase 2: Verify Merkle proofs for revealed gradients.
@@ -488,7 +488,7 @@ class ProtoGalaxyOrchestrator:
                 self.galaxy_manager.dissolve_galaxy(
                     galaxy_id=dissolution['dissolved_galaxy'],
                     honest_clients=list(dissolution['reassignments'].keys()),
-                    malicious_clients=dissolution['clients_quarantined']
+                    malicious_clients=dissolution['quarantined_client_ids']
                 )
         
         # Get clean updates (only from non-flagged galaxies)
@@ -545,7 +545,8 @@ class ProtoGalaxyOrchestrator:
             param_vector = torch.cat([p.data.flatten() for p in self.model.parameters()])
             
             # Apply gradient update (gradient descent)
-            learning_rate = 0.01  # Could be configurable
+            # lr=1.0 for FedAvg: w_new = w_global - 1.0 * avg(w_global - w_local_i) = avg(w_local_i)
+            learning_rate = 1.0
             param_vector -= learning_rate * global_update
             
             # Unflatten back to model
@@ -567,11 +568,13 @@ class ProtoGalaxyOrchestrator:
             fold_start = _time.time()
             
             for galaxy_id in range(self.num_galaxies):
+                if galaxy_id not in clean_galaxy_updates:
+                    continue  # Skip flagged/dissolved galaxies
                 galaxy_clients = self.galaxy_manager.get_galaxy_clients(galaxy_id)
                 galaxy_proofs = [
                     self.client_zk_proofs[cid]
                     for cid in galaxy_clients
-                    if cid in self.client_zk_proofs and cid in clean_galaxy_updates
+                    if cid in self.client_zk_proofs
                 ]
                 
                 if galaxy_proofs:

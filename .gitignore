@@ -21,6 +21,10 @@ wheels/
 .installed.cfg
 *.egg
 
+fl_results/
+fl_results_100/
+fl_results_1000/
+
 # Virtual environments
 venv/
 ENV/

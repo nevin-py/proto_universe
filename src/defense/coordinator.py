@@ -16,7 +16,7 @@ from src.defense.statistical import (
     StatisticalDefenseLayer2,
     StatisticalAnalyzer
 )
-from src.defense.robust_agg import TrimmedMeanAggregator, MultiKrumAggregator
+from src.defense.robust_agg import TrimmedMeanAggregator, MultiKrumAggregator, CoordinateWiseMedianAggregator
 from src.defense.reputation import ReputationManager
 from src.defense.layer5_galaxy import Layer5GalaxyDefense
 from src.storage.forensic_logger import ForensicLogger
@@ -30,6 +30,7 @@ class DefenseCoordinator:
     
     AGGREGATOR_TRIMMED_MEAN = 'trimmed_mean'
     AGGREGATOR_MULTI_KRUM = 'multi_krum'
+    AGGREGATOR_COORDINATE_MEDIAN = 'coordinate_wise_median'
     
     def __init__(self, num_clients: int, num_galaxies: int, config: Optional[dict] = None):
         """Initialize defense coordinator.
@@ -90,6 +91,8 @@ class DefenseCoordinator:
                 f=self.config['layer3_krum_f'],
                 m=self.config['layer3_krum_m']
             )
+        elif self.config['layer3_method'] == self.AGGREGATOR_COORDINATE_MEDIAN:
+            self.layer3 = CoordinateWiseMedianAggregator()
         else:  # Default to Trimmed Mean
             self.layer3 = TrimmedMeanAggregator(
                 trim_ratio=self.config['layer3_trim_ratio']
@@ -156,8 +159,24 @@ class DefenseCoordinator:
             
             all_anomalies = set(layer1_anomalies + layer2_anomalies)
         
-        # Layer 3: Robust aggregation
-        agg_result = self.layer3.aggregate(updates)
+        # ── Filter flagged updates before L3 aggregation ──────────────
+        # Architecture requires defense layers to feed forward: clients
+        # flagged by L1/L2 statistical analysis should be excluded from
+        # the robust aggregation in L3 so that poisoned gradients do not
+        # contaminate the trimmed-mean / Krum computation.
+        if all_anomalies:
+            cleaned_updates = [
+                u for i, u in enumerate(updates) if i not in all_anomalies
+            ]
+            # Safety: keep at least 1 update (never empty-aggregate)
+            if len(cleaned_updates) < 1:
+                cleaned_updates = updates  # fallback to full set
+        else:
+            cleaned_updates = updates
+        results['cleaned_updates'] = cleaned_updates
+        
+        # Layer 3: Robust aggregation (on cleaned set)
+        agg_result = self.layer3.aggregate(cleaned_updates)
         results['layer3_aggregation'] = agg_result
         
         # Store layer 3 specific info
@@ -168,7 +187,7 @@ class DefenseCoordinator:
                 'frequently_trimmed': self.layer3.get_frequently_trimmed_clients()
             }
             trimmed_or_rejected = {idx for idx, _ in results['layer3_info']['frequently_trimmed']}
-        else:
+        elif isinstance(self.layer3, MultiKrumAggregator):
             results['layer3_info'] = {
                 'method': 'multi_krum',
                 'selected_indices': self.layer3.get_selected_indices()
@@ -176,6 +195,15 @@ class DefenseCoordinator:
             # Clients NOT selected by Krum are implicitly rejected
             selected = set(self.layer3.get_selected_indices())
             trimmed_or_rejected = {i for i in range(len(updates))} - selected
+        elif isinstance(self.layer3, CoordinateWiseMedianAggregator):
+            results['layer3_info'] = {
+                'method': 'coordinate_wise_median'
+            }
+            # CWMed uses all updates (median is inherently robust)
+            trimmed_or_rejected = set()
+        else:
+            results['layer3_info'] = {'method': 'unknown'}
+            trimmed_or_rejected = set()
         
         # =====================================================================
         # Layer 4: Full behavior score update (Architecture Section 4.4)
@@ -183,6 +211,10 @@ class DefenseCoordinator:
         # Uses update_behavior_score() instead of simple penalize_client()
         # =====================================================================
         statistical_flagged = set(results.get('statistical_flagged', []))
+        # Build a set of original-update indices that survived to cleaned_updates
+        survived_indices = set(
+            i for i in range(len(updates)) if i not in all_anomalies
+        ) if all_anomalies else set(range(len(updates)))
         for i, update in enumerate(updates):
             client_id = update.get('client_id', i)
             if client_id >= self.num_clients:
@@ -192,7 +224,7 @@ class DefenseCoordinator:
             layer_results = {
                 'integrity': True,  # Layer 1 integrity always passes if we reach here
                 'statistical': client_id not in statistical_flagged and i not in all_anomalies,
-                'krum': i not in trimmed_or_rejected,
+                'krum': i in survived_indices and i not in trimmed_or_rejected,
             }
             
             # Use the full multi-indicator behavior scoring
@@ -256,6 +288,9 @@ class DefenseCoordinator:
             f = kwargs.get('f', self.config['layer3_krum_f'])
             m = kwargs.get('m', self.config['layer3_krum_m'])
             self.layer3 = MultiKrumAggregator(f=f, m=m)
+            self.config['layer3_method'] = method
+        elif method == self.AGGREGATOR_COORDINATE_MEDIAN:
+            self.layer3 = CoordinateWiseMedianAggregator()
             self.config['layer3_method'] = method
         else:
             raise ValueError(f"Unknown aggregation method: {method}")

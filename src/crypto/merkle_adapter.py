@@ -89,7 +89,11 @@ class GlobalMerkleTreeAdapter:
         galaxy_root_list: List[Dict],  # [{'galaxy_id': int, 'merkle_root': str}]
         round_number: int = 0
     ) -> str:
-        """Build global Merkle tree from galaxy roots"""
+        """Build global Merkle tree from galaxy roots.
+        
+        Galaxy roots are already 64-char hex SHA-256 hashes and are used
+        directly as leaf hashes — no additional metadata hashing is applied.
+        """
         self.galaxy_roots = {}
         self.galaxy_ids = []
         roots = []
@@ -101,16 +105,8 @@ class GlobalMerkleTreeAdapter:
             self.galaxy_ids.append(galaxy_id)
             roots.append(root)
         
-        # Build metadata
-        metadata_list = []
-        for galaxy_id in self.galaxy_ids:
-            metadata_list.append({
-                'galaxy_id': galaxy_id,
-                'round_number': round_number
-            })
-        
-        # Build tree from galaxy roots
-        self.tree = MerkleTree(data=roots, metadata_list=metadata_list)
+        # Build tree from galaxy roots (no metadata — roots are already hashes)
+        self.tree = MerkleTree(data=roots)
         
         root = self.tree.get_root()
         return root if root is not None else ""
