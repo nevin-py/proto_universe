@@ -137,11 +137,12 @@ class DefenseCoordinator:
         
         # Layer 1 & 2: Statistical detection
         if self.use_full_analyzer:
-            # Use 3-metric analyzer (PROTO-302 compliant)
+            # Use 4-metric analyzer (Architecture Section 4.2)
             analysis = self.statistical_analyzer.analyze(updates)
             results['layer1_detections'] = analysis.get('norm_outliers', [])
             results['layer2_detections'] = analysis.get('direction_outliers', [])
             results['coordinate_outliers'] = analysis.get('coordinate_outliers', [])
+            results['distribution_outliers'] = analysis.get('distribution_outliers', [])
             results['statistical_flagged'] = analysis.get('flagged_clients', [])
             results['failure_counts'] = analysis.get('failure_counts', {})
             all_anomalies = set(analysis.get('flagged_indices', []))
@@ -155,30 +156,51 @@ class DefenseCoordinator:
             
             all_anomalies = set(layer1_anomalies + layer2_anomalies)
         
-        # Penalize detected clients in Layer 4 (reputation)
-        for idx in all_anomalies:
-            if idx < self.num_clients:
-                self.layer4.penalize_client(idx)
-        
         # Layer 3: Robust aggregation
         agg_result = self.layer3.aggregate(updates)
         results['layer3_aggregation'] = agg_result
         
         # Store layer 3 specific info
+        trimmed_or_rejected = set()
         if isinstance(self.layer3, TrimmedMeanAggregator):
             results['layer3_info'] = {
                 'method': 'trimmed_mean',
                 'frequently_trimmed': self.layer3.get_frequently_trimmed_clients()
             }
-            # Penalize frequently trimmed clients
-            for client_idx, trim_fraction in results['layer3_info']['frequently_trimmed']:
-                if client_idx < self.num_clients:
-                    self.layer4.penalize_client(client_idx, penalty=trim_fraction * 0.2)
+            trimmed_or_rejected = {idx for idx, _ in results['layer3_info']['frequently_trimmed']}
         else:
             results['layer3_info'] = {
                 'method': 'multi_krum',
                 'selected_indices': self.layer3.get_selected_indices()
             }
+            # Clients NOT selected by Krum are implicitly rejected
+            selected = set(self.layer3.get_selected_indices())
+            trimmed_or_rejected = {i for i in range(len(updates))} - selected
+        
+        # =====================================================================
+        # Layer 4: Full behavior score update (Architecture Section 4.4)
+        # B(t) = w1*I_integrity + w2*I_statistical + w3*I_krum + w4*I_historical
+        # Uses update_behavior_score() instead of simple penalize_client()
+        # =====================================================================
+        statistical_flagged = set(results.get('statistical_flagged', []))
+        for i, update in enumerate(updates):
+            client_id = update.get('client_id', i)
+            if client_id >= self.num_clients:
+                continue
+            
+            # Determine per-layer pass/fail for this client
+            layer_results = {
+                'integrity': True,  # Layer 1 integrity always passes if we reach here
+                'statistical': client_id not in statistical_flagged and i not in all_anomalies,
+                'krum': i not in trimmed_or_rejected,
+            }
+            
+            # Use the full multi-indicator behavior scoring
+            self.layer4.update_behavior_score(
+                client_id=client_id,
+                layer_results=layer_results,
+                round_number=len(self.detection_results)
+            )
         
         # Layer 4: Get reputation scores
         results['reputation_scores'] = self.layer4.get_all_reputations()

@@ -1,11 +1,13 @@
 """Statistical defense mechanisms for Byzantine-resilient aggregation
 
-This module implements the 3-metric statistical analyzer as specified in PROTO-302:
+This module implements the 4-metric statistical analyzer (Architecture Section 4.2):
 1. Norm deviation (threshold: 3σ)
 2. Direction similarity (cosine threshold: 0.5)
 3. Coordinate-wise analysis (per-dimension outliers)
-"""
+4. Distribution shift detection (KL-divergence)
 
+A gradient is flagged as anomalous if it fails ≥2 of the 4 metrics.
+"""
 import numpy as np
 import torch
 from typing import List, Dict, Tuple, Set
@@ -24,14 +26,15 @@ def _flatten_gradients(gradients: list) -> np.ndarray:
 
 class StatisticalAnalyzer:
     """
-    Multi-metric anomaly detection for client gradients (PROTO-302).
+    Multi-metric anomaly detection for client gradients (Architecture Section 4.2).
     
-    Implements 3 detection metrics:
+    Implements 4 detection metrics:
     1. Norm deviation - flags gradients with unusual L2 norms (>3σ from mean)
     2. Direction similarity - flags gradients with low cosine similarity to mean (<0.5)
     3. Coordinate-wise analysis - flags gradients with outlier coordinates
+    4. Distribution shift - flags gradients with high KL-divergence from aggregate
     
-    A gradient is flagged as anomalous if it fails ≥2 metrics.
+    A gradient is flagged as anomalous if it fails ≥2 of the 4 metrics.
     """
     
     def __init__(
@@ -39,6 +42,7 @@ class StatisticalAnalyzer:
         norm_threshold_sigma: float = 3.0,
         cosine_threshold: float = 0.5,
         coordinate_threshold_sigma: float = 3.0,
+        kl_divergence_threshold: float = 2.0,
         min_failures_to_flag: int = 2
     ):
         """
@@ -48,11 +52,13 @@ class StatisticalAnalyzer:
             norm_threshold_sigma: Number of standard deviations for norm outlier detection
             cosine_threshold: Minimum cosine similarity to mean gradient
             coordinate_threshold_sigma: Number of std devs for coordinate-wise outliers
+            kl_divergence_threshold: Max KL-divergence from aggregate distribution
             min_failures_to_flag: Minimum number of failed metrics to flag as anomaly
         """
         self.norm_threshold_sigma = norm_threshold_sigma
         self.cosine_threshold = cosine_threshold
         self.coordinate_threshold_sigma = coordinate_threshold_sigma
+        self.kl_divergence_threshold = kl_divergence_threshold
         self.min_failures_to_flag = min_failures_to_flag
         
         # Detection history
@@ -61,7 +67,7 @@ class StatisticalAnalyzer:
     
     def analyze(self, updates: List[Dict]) -> Dict:
         """
-        Analyze gradient updates using all 3 metrics.
+        Analyze gradient updates using all 4 metrics (Architecture Section 4.2).
         
         Args:
             updates: List of update dicts with 'client_id' and 'gradients' keys
@@ -75,6 +81,7 @@ class StatisticalAnalyzer:
                 'norm_outliers': [],
                 'direction_outliers': [],
                 'coordinate_outliers': [],
+                'distribution_outliers': [],
                 'failure_counts': {}
             }
         
@@ -82,12 +89,13 @@ class StatisticalAnalyzer:
         client_ids = [u.get('client_id', i) for i, u in enumerate(updates)]
         flattened = np.array([_flatten_gradients(u['gradients']) for u in updates])
         
-        # Run all 3 metrics
+        # Run all 4 metrics
         norm_outliers = self._detect_norm_deviation(flattened)
         direction_outliers = self._detect_direction_anomaly(flattened)
         coordinate_outliers = self._detect_coordinate_outliers(flattened)
+        distribution_outliers = self._detect_distribution_shift(flattened)
         
-        # Count failures per client
+        # Count failures per client (out of 4 metrics)
         failure_counts = {}
         for i in range(len(updates)):
             failures = 0
@@ -96,6 +104,8 @@ class StatisticalAnalyzer:
             if i in direction_outliers:
                 failures += 1
             if i in coordinate_outliers:
+                failures += 1
+            if i in distribution_outliers:
                 failures += 1
             failure_counts[client_ids[i]] = failures
         
@@ -109,7 +119,8 @@ class StatisticalAnalyzer:
             'flagged': flagged_clients,
             'norm_outliers': [client_ids[i] for i in norm_outliers],
             'direction_outliers': [client_ids[i] for i in direction_outliers],
-            'coordinate_outliers': [client_ids[i] for i in coordinate_outliers]
+            'coordinate_outliers': [client_ids[i] for i in coordinate_outliers],
+            'distribution_outliers': [client_ids[i] for i in distribution_outliers]
         })
         
         return {
@@ -118,6 +129,7 @@ class StatisticalAnalyzer:
             'norm_outliers': [client_ids[i] for i in norm_outliers],
             'direction_outliers': [client_ids[i] for i in direction_outliers],
             'coordinate_outliers': [client_ids[i] for i in coordinate_outliers],
+            'distribution_outliers': [client_ids[i] for i in distribution_outliers],
             'failure_counts': failure_counts
         }
     
@@ -181,6 +193,38 @@ class StatisticalAnalyzer:
         # Flag if more than 10% of coordinates are outliers
         threshold_count = max(1, int(0.1 * flattened.shape[1]))
         outliers = np.where(outlier_coords_count > threshold_count)[0].tolist()
+        
+        return outliers
+    
+    def _detect_distribution_shift(self, flattened: np.ndarray) -> List[int]:
+        """
+        Metric 4: Distribution shift detection via KL-divergence (Architecture Section 4.2).
+        Bins each gradient into a histogram and computes KL-divergence against
+        the aggregate distribution. Flags gradients with high divergence.
+        """
+        num_bins = min(50, max(10, flattened.shape[1] // 10))
+        
+        # Build aggregate distribution from all gradients combined
+        all_values = flattened.flatten()
+        bin_edges = np.histogram_bin_edges(all_values, bins=num_bins)
+        
+        aggregate_hist, _ = np.histogram(all_values, bins=bin_edges, density=True)
+        # Add small epsilon to avoid div-by-zero in KL
+        eps = 1e-10
+        aggregate_hist = aggregate_hist + eps
+        aggregate_hist = aggregate_hist / aggregate_hist.sum()
+        
+        outliers = []
+        for i, grad in enumerate(flattened):
+            grad_hist, _ = np.histogram(grad, bins=bin_edges, density=True)
+            grad_hist = grad_hist + eps
+            grad_hist = grad_hist / grad_hist.sum()
+            
+            # KL(grad || aggregate)
+            kl = np.sum(grad_hist * np.log(grad_hist / aggregate_hist))
+            
+            if kl > self.kl_divergence_threshold:
+                outliers.append(i)
         
         return outliers
     

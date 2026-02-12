@@ -7,12 +7,12 @@ Implements the complete 4-phase federated learning protocol per Architecture Sec
 - Phase 4: Global aggregation and model distribution
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import torch
 import logging
 from dataclasses import dataclass
 
-from src.crypto.merkle import GalaxyMerkleTree, GlobalMerkleTree
+from src.crypto.merkle import GalaxyMerkleTree, GlobalMerkleTree, GradientCommitment
 from src.crypto.zkp_prover import GradientSumCheckProver, GalaxyProofFolder, ZKProof
 from src.defense.coordinator import DefenseCoordinator
 from src.aggregators.galaxy import GalaxyAggregator
@@ -96,7 +96,7 @@ class ProtoGalaxyOrchestrator:
     def run_round(
         self,
         client_updates: Dict[int, torch.Tensor],
-        client_commitments: Dict[int, str],
+        client_commitments: Dict[int, GradientCommitment],
         client_proofs: Optional[Dict[int, List]] = None,
         client_gradients: Optional[Dict[int, List]] = None
     ) -> Dict:

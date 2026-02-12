@@ -23,6 +23,8 @@ import torch.nn as nn
 import numpy as np
 
 from src.client.trainer import Trainer
+from src.client.commitment import CommitmentGenerator
+from src.client.verifier import ProofVerifier
 from src.crypto.merkle_adapter import GalaxyMerkleTreeAdapter, GlobalMerkleTreeAdapter
 from src.crypto.utils import generate_timestamp, generate_nonce_hex
 from src.crypto.merkle import compute_hash
@@ -150,10 +152,18 @@ class ProtoGalaxyPipeline:
         # Model synchronizer
         self.model_sync = ModelSynchronizer(global_model)
         
+        # Client commitment generators and proof verifier
+        self.commitment_generators: Dict[int, CommitmentGenerator] = {
+            cid: CommitmentGenerator(client_id=cid)
+            for cid in range(num_clients)
+        }
+        self.proof_verifier = ProofVerifier()
+        
         # Storage for current round
         self.round_commitments: Dict[int, Dict[int, str]] = {}  # galaxy_id -> {client_id -> hash}
         self.round_submissions: Dict[int, Dict[int, ClientSubmission]] = {}  # galaxy_id -> {client_id -> submission}
         self.round_galaxy_submissions: Dict[int, GalaxySubmission] = {}  # galaxy_id -> submission
+        self.round_commitment_objects: Dict[int, Any] = {}  # client_id -> GradientCommitment
         
         # Statistics
         self.round_stats = []
@@ -193,24 +203,19 @@ class ProtoGalaxyPipeline:
         Returns:
             Tuple of (commitment_hash, metadata)
         """
-        # Generate metadata
-        metadata = {
-            'client_id': client_id,
-            'round': round_number,
-            'timestamp': generate_timestamp(),
-            'nonce': generate_nonce_hex(16)
-        }
+        # Use CommitmentGenerator to produce a proper GradientCommitment
+        gen = self.commitment_generators.get(client_id)
+        if gen is None:
+            gen = CommitmentGenerator(client_id=client_id)
+            self.commitment_generators[client_id] = gen
         
-        # Compute commitment hash directly
-        # Concatenate all gradients and hash with metadata
-        grad_bytes = b''
-        for g in gradients:
-            if isinstance(g, torch.Tensor):
-                grad_bytes += g.detach().cpu().numpy().tobytes()
-            else:
-                grad_bytes += np.array(g).tobytes()
+        commitment_obj = gen.generate_commitment(gradients, round_number=round_number)
+        commitment_hash = commitment_obj.commitment
         
-        commitment_hash = compute_hash(grad_bytes, metadata)
+        # Store commitment object for later verification in Phase 2
+        self.round_commitment_objects[client_id] = commitment_obj
+        
+        metadata = commitment_obj.get_metadata()
         
         if self.logger:
             self.logger.debug(f"Client {client_id} generated commitment", extra={
@@ -355,8 +360,22 @@ class ProtoGalaxyPipeline:
         rejected_clients = []
         
         merkle_tree = self.galaxy_merkle_trees[galaxy_id]
+        defense_coordinator = self.galaxy_defense_coordinators[galaxy_id]
         
         for client_id, submission in submissions.items():
+            # ============================================================
+            # Gap 3: Quarantine/Ban enforcement (Architecture Section 4.4)
+            # Reject quarantined or banned clients BEFORE accepting them.
+            # ============================================================
+            if not defense_coordinator.layer4.is_active(client_id):
+                rejected_clients.append(client_id)
+                status = defense_coordinator.layer4.get_client_status(client_id)
+                if self.logger:
+                    self.logger.warning(
+                        f"Client {client_id} rejected: status={status}"
+                    )
+                continue
+            
             # Verify against commitment
             expected_hash = self.round_commitments[galaxy_id].get(client_id)
             
@@ -366,13 +385,17 @@ class ProtoGalaxyPipeline:
                     self.logger.warning(f"No commitment found for client {client_id}")
                 continue
             
-            # Verify Merkle proof
+            # Verify Merkle proof using ProofVerifier
             proof = merkle_tree.get_proof(client_id)
-            is_valid = merkle_tree.verify_proof(
-                client_id,
-                submission.commitment_hash,
-                proof
-            )
+            root = merkle_tree.get_root()
+            if root and proof is not None:
+                index = merkle_tree.client_ids.index(client_id) if client_id in merkle_tree.client_ids else -1
+                leaf_hash = submission.commitment_hash
+                is_valid = self.proof_verifier.verify_proof(
+                    root, proof, leaf_hash, leaf_index=index
+                )
+            else:
+                is_valid = False
             
             if not is_valid:
                 rejected_clients.append(client_id)
@@ -380,11 +403,22 @@ class ProtoGalaxyPipeline:
                     self.logger.warning(f"Invalid Merkle proof for client {client_id}")
                 continue
             
-            # Store verified submission
+            # ============================================================
+            # Gap 2: Trust-weighted aggregation (Architecture Section 4.4)
+            # Weight gradients by reputation: w_bar = Sum(R_i * grad_i) / Sum(R_i)
+            # Apply reputation weight before passing to aggregation.
+            # ============================================================
+            reputation = defense_coordinator.layer4.get_reputation(client_id)
+            weighted_gradients = []
+            for g in submission.gradients:
+                weighted_gradients.append(g * reputation)
+            
+            # Store verified submission with weighted gradients
             verified_updates.append({
                 'client_id': client_id,
-                'gradients': submission.gradients,
-                'metadata': submission.metadata
+                'gradients': weighted_gradients,
+                'metadata': submission.metadata,
+                'reputation': reputation
             })
         
         # Store for this round
@@ -428,8 +462,31 @@ class ProtoGalaxyPipeline:
         # Run defense pipeline
         defense_result = defense_coordinator.run_defense_pipeline(verified_updates)
         
-        # Extract aggregated gradients
-        aggregated_gradients = defense_result['layer3_aggregation']
+        # Extract aggregated gradients from TrimmedMeanAggregator output.
+        # The aggregator returns {'gradients': flat_np_array, 'trimmed_counts': ...}
+        # We need to reconstruct a list of tensors with proper shapes.
+        agg_raw = defense_result['layer3_aggregation']
+        if agg_raw is not None and isinstance(agg_raw, dict) and 'gradients' in agg_raw:
+            flat_grads = agg_raw['gradients']
+            if isinstance(flat_grads, np.ndarray):
+                # Reconstruct tensor list from flattened array using first client's shapes
+                first_update_grads = verified_updates[0]['gradients']
+                reconstructed = []
+                offset = 0
+                for g in first_update_grads:
+                    if isinstance(g, torch.Tensor):
+                        shape = g.shape
+                    else:
+                        shape = np.array(g).shape
+                    numel = int(np.prod(shape))
+                    chunk = flat_grads[offset:offset + numel]
+                    reconstructed.append(torch.tensor(chunk.reshape(shape), dtype=torch.float32))
+                    offset += numel
+                aggregated_gradients = reconstructed
+            else:
+                aggregated_gradients = flat_grads
+        else:
+            aggregated_gradients = agg_raw
         
         # Get flagged clients
         flagged_clients = list(set(
@@ -448,11 +505,9 @@ class ProtoGalaxyPipeline:
         
         if self.logger:
             self.logger.log_detection(
-                round_number=self.current_round,
-                galaxy_id=galaxy_id,
-                flagged_clients=flagged_clients,
-                detection_method='multi_layer',
-                metadata=defense_report
+                detected_clients=[str(c) for c in flagged_clients],
+                detection_type='multi_layer',
+                layer=f'galaxy_{galaxy_id}'
             )
         
         return aggregated_gradients, defense_report
@@ -544,24 +599,94 @@ class ProtoGalaxyPipeline:
         
         return verified_updates, rejected_galaxies
     
-    def phase4_global_defense_and_aggregate(
+    def phase4_layer5_galaxy_defense(
         self,
         verified_galaxy_updates: List[Dict]
+    ) -> Dict:
+        """
+        Phase 4: Run Layer 5 galaxy-level defense (Architecture Section 4.5).
+        
+        Treats each galaxy's aggregated update as a "super-client" and applies:
+        - Galaxy anomaly detection (norm, direction, cross-galaxy consistency)
+        - Galaxy reputation updates
+        - Adaptive re-clustering for compromised galaxies
+        - Forensic logging for quarantine/ban decisions
+        
+        Args:
+            verified_galaxy_updates: List of verified galaxy updates
+            
+        Returns:
+            Layer 5 defense results
+        """
+        # Build galaxy_updates dict for Layer 5
+        galaxy_updates = {}
+        for update in verified_galaxy_updates:
+            galaxy_updates[update['galaxy_id']] = update['gradients']
+        
+        # Build client assignments reverse map
+        client_assignments = {}
+        for galaxy_id, client_ids in self.galaxy_assignments.items():
+            for cid in client_ids:
+                client_assignments[cid] = galaxy_id
+        
+        # Run Layer 5: Galaxy-level defense with forensic logging
+        layer5_result = self.global_defense.run_galaxy_defense(
+            galaxy_updates=galaxy_updates,
+            client_assignments=client_assignments,
+            round_number=self.current_round
+        )
+        
+        return layer5_result
+    
+    def phase4_global_defense_and_aggregate(
+        self,
+        verified_galaxy_updates: List[Dict],
+        layer5_result: Optional[Dict] = None
     ) -> Tuple[List[torch.Tensor], Dict]:
         """
         Phase 4: Global runs defense pipeline and final aggregation.
         
         Args:
             verified_galaxy_updates: List of verified galaxy updates
+            layer5_result: Optional Layer 5 defense results for filtering
             
         Returns:
             Tuple of (global_gradients, defense_report)
         """
+        # Filter out galaxies flagged by Layer 5
+        if layer5_result and layer5_result.get('flagged_galaxies'):
+            flagged_gids = set(layer5_result['flagged_galaxies'])
+            filtered_updates = [
+                u for u in verified_galaxy_updates
+                if u['galaxy_id'] not in flagged_gids
+            ]
+            if filtered_updates:
+                verified_galaxy_updates = filtered_updates
+        
         # Run global defense pipeline (treat galaxies as super-clients)
         defense_result = self.global_defense.run_defense_pipeline(verified_galaxy_updates)
         
-        # Extract final aggregated gradients
-        global_gradients = defense_result['layer3_aggregation']
+        # Extract final aggregated gradients (same unwrapping as Phase 3)
+        agg_raw = defense_result['layer3_aggregation']
+        if agg_raw is not None and isinstance(agg_raw, dict) and 'gradients' in agg_raw:
+            flat_grads = agg_raw['gradients']
+            if isinstance(flat_grads, np.ndarray) and verified_galaxy_updates:
+                first_grads = verified_galaxy_updates[0]['gradients']
+                global_gradients = []
+                offset = 0
+                for g in first_grads:
+                    if isinstance(g, torch.Tensor):
+                        shape = g.shape
+                    else:
+                        shape = np.array(g).shape
+                    numel = int(np.prod(shape))
+                    chunk = flat_grads[offset:offset + numel]
+                    global_gradients.append(torch.tensor(chunk.reshape(shape), dtype=torch.float32))
+                    offset += numel
+            else:
+                global_gradients = flat_grads
+        else:
+            global_gradients = agg_raw
         
         defense_report = {
             'flagged_galaxies': list(set(
@@ -572,12 +697,25 @@ class ProtoGalaxyPipeline:
             'galaxy_reputations': defense_result.get('reputation_scores', {})
         }
         
+        # Merge Layer 5 results if available
+        if layer5_result:
+            defense_report['layer5_flagged_galaxies'] = layer5_result.get('flagged_galaxies', [])
+            defense_report['layer5_anomaly_reports'] = {
+                gid: {
+                    'is_anomalous': report.is_anomalous,
+                    'norm_deviation': report.norm_deviation_score,
+                    'direction_similarity': report.direction_similarity,
+                    'consistency': report.cross_galaxy_consistency
+                }
+                for gid, report in layer5_result.get('anomaly_reports', {}).items()
+            }
+            defense_report['layer5_dissolutions'] = layer5_result.get('dissolutions', [])
+        
         if self.logger:
             self.logger.log_aggregation(
-                round_number=self.current_round,
-                aggregator='global',
-                num_updates=len(verified_galaxy_updates),
-                metadata=defense_report
+                num_gradients=len(verified_galaxy_updates),
+                method=defense_report['aggregation_method'],
+                galaxy_id=None
             )
         
         return global_gradients, defense_report
@@ -739,15 +877,18 @@ class ProtoGalaxyPipeline:
             galaxy_final_submissions
         )
         
-        # Step 4b: Global defense and aggregation
+        # Step 4b: Layer 5 galaxy-level defense (Architecture Section 4.5)
+        layer5_result = self.phase4_layer5_galaxy_defense(verified_galaxies)
+        
+        # Step 4c: Global defense and aggregation (with Layer 5 filtering)
         global_gradients, global_defense_report = self.phase4_global_defense_and_aggregate(
-            verified_galaxies
+            verified_galaxies, layer5_result=layer5_result
         )
         
-        # Step 4c: Update global model
+        # Step 4d: Update global model
         self.phase4_update_global_model(global_gradients)
         
-        # Step 4d: Distribute model
+        # Step 4e: Distribute model
         sync_package = self.phase4_distribute_model()
         
         # =========================
@@ -764,6 +905,8 @@ class ProtoGalaxyPipeline:
             'verified_clients': sum(len(g.client_ids) for g in galaxy_final_submissions.values()),
             'rejected_clients': sum(len(r) for r in galaxy_rejected_clients.values()),
             'flagged_galaxies': global_defense_report.get('flagged_galaxies', []),
+            'layer5_flagged': global_defense_report.get('layer5_flagged_galaxies', []),
+            'layer5_dissolutions': global_defense_report.get('layer5_dissolutions', []),
             'model_hash': sync_package['model_hash'],
             'round_time': round_time
         }
@@ -772,10 +915,9 @@ class ProtoGalaxyPipeline:
         
         if self.logger:
             self.logger.log_round_end(
-                round_number,
-                accuracy=0.0,  # To be filled by caller
-                loss=0.0,  # To be filled by caller
-                metadata=round_stats
+                round_num=round_number,
+                duration=round_time,
+                metrics=round_stats
             )
         
         return round_stats
