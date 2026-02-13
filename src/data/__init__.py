@@ -14,6 +14,7 @@ from src.data.partition import (
     DirichletPartitioner
 )
 from src.data.loader import create_client_loaders
+from src.data.backdoor import BackdoorDataset
 
 __all__ = [
     'load_mnist',
@@ -22,5 +23,6 @@ __all__ = [
     'IIDPartitioner',
     'NonIIDPartitioner',
     'DirichletPartitioner',
-    'create_client_loaders'
+    'create_client_loaders',
+    'BackdoorDataset',
 ]

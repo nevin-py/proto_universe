@@ -11,10 +11,14 @@ from src.client.client import Client
 from src.client.trainer import Trainer
 from src.client.commitment import CommitmentGenerator
 from src.client.verifier import ProofVerifier
+from src.client.adaptive_attacker import AdaptiveAttacker
+from src.client.sybil_coordinator import SybilCoordinator
 
 __all__ = [
     'Client',
     'Trainer',
     'CommitmentGenerator',
-    'ProofVerifier'
+    'ProofVerifier',
+    'AdaptiveAttacker',
+    'SybilCoordinator',
 ]

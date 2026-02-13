@@ -35,7 +35,7 @@ Current state-of-the-art approaches address these challenges in isolation:
 
 ### 1.3 Paper Organization
 
-Section 2 presents our threat model and security assumptions. Section 3 details the Protogalaxy architecture. Section 4 describes each defense layer's algorithms and guarantees. Section 5 provides security analysis and theoretical bounds. Section 6 outlines experimental methodology. Section 7 discusses limitations and future work.
+Section 2 presents our threat model and security assumptions. Section 3 details the Protogalaxy architecture. Section 4 describes each defense layer's algorithms and guarantees. Section 5 provides sty ecurianalysis and theoretical bounds. Section 6 outlines experimental methodology. Section 7 discusses limitations and future work.
 
 ---
 

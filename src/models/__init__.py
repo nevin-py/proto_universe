@@ -17,12 +17,14 @@ from src.models.registry import (
     SimpleMLP,
     CIFAR10CNN
 )
+from src.models.resnet import CIFAR10ResNet18
 
 __all__ = [
     'MNISTCnn',
     'create_mnist_model',
     'SimpleMLP',
     'CIFAR10CNN',
+    'CIFAR10ResNet18',
     'get_model',
     'list_models',
     'create_model',

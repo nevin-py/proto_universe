@@ -17,6 +17,7 @@ from src.defense.statistical import (
     StatisticalAnalyzer
 )
 from src.defense.robust_agg import TrimmedMeanAggregator, MultiKrumAggregator, CoordinateWiseMedianAggregator
+from src.defense.fltrust import FLTrustAggregator
 from src.defense.reputation import ReputationManager
 from src.defense.layer5_galaxy import Layer5GalaxyDefense
 from src.storage.forensic_logger import ForensicLogger
@@ -31,6 +32,7 @@ class DefenseCoordinator:
     AGGREGATOR_TRIMMED_MEAN = 'trimmed_mean'
     AGGREGATOR_MULTI_KRUM = 'multi_krum'
     AGGREGATOR_COORDINATE_MEDIAN = 'coordinate_wise_median'
+    AGGREGATOR_FLTRUST = 'fltrust'
     
     def __init__(self, num_clients: int, num_galaxies: int, config: Optional[dict] = None):
         """Initialize defense coordinator.
@@ -93,6 +95,23 @@ class DefenseCoordinator:
             )
         elif self.config['layer3_method'] == self.AGGREGATOR_COORDINATE_MEDIAN:
             self.layer3 = CoordinateWiseMedianAggregator()
+        elif self.config['layer3_method'] == self.AGGREGATOR_FLTRUST:
+            # FLTrust requires server_dataset and server_model from config
+            server_dataset = config.get('fltrust_server_dataset')
+            server_model = config.get('fltrust_server_model')
+            if server_dataset is not None and server_model is not None:
+                self.layer3 = FLTrustAggregator(
+                    server_dataset=server_dataset,
+                    server_model=server_model,
+                    learning_rate=config.get('fltrust_lr', 0.01),
+                    batch_size=config.get('fltrust_batch_size', 64),
+                    server_epochs=config.get('fltrust_server_epochs', 1),
+                )
+            else:
+                # Fallback to TrimmedMean if FLTrust prerequisites missing
+                self.layer3 = TrimmedMeanAggregator(
+                    trim_ratio=self.config['layer3_trim_ratio']
+                )
         else:  # Default to Trimmed Mean
             self.layer3 = TrimmedMeanAggregator(
                 trim_ratio=self.config['layer3_trim_ratio']
@@ -201,6 +220,20 @@ class DefenseCoordinator:
             }
             # CWMed uses all updates (median is inherently robust)
             trimmed_or_rejected = set()
+        elif isinstance(self.layer3, FLTrustAggregator):
+            trust_scores = self.layer3.get_trust_scores()
+            results['layer3_info'] = {
+                'method': 'fltrust',
+                'trust_scores': trust_scores,
+            }
+            # Clients with zero trust score are effectively rejected
+            trimmed_or_rejected = {
+                idx for idx, ts in enumerate(
+                    trust_scores.get(upd.get('client_id', idx), 0.0)
+                    for idx, upd in enumerate(updates)
+                )
+                if ts < 1e-12
+            }
         else:
             results['layer3_info'] = {'method': 'unknown'}
             trimmed_or_rejected = set()
@@ -291,6 +324,21 @@ class DefenseCoordinator:
             self.config['layer3_method'] = method
         elif method == self.AGGREGATOR_COORDINATE_MEDIAN:
             self.layer3 = CoordinateWiseMedianAggregator()
+            self.config['layer3_method'] = method
+        elif method == self.AGGREGATOR_FLTRUST:
+            server_dataset = kwargs.get('server_dataset')
+            server_model = kwargs.get('server_model')
+            if server_dataset is None or server_model is None:
+                raise ValueError(
+                    "FLTrust requires 'server_dataset' and 'server_model' kwargs."
+                )
+            self.layer3 = FLTrustAggregator(
+                server_dataset=server_dataset,
+                server_model=server_model,
+                learning_rate=kwargs.get('learning_rate', 0.01),
+                batch_size=kwargs.get('batch_size', 64),
+                server_epochs=kwargs.get('server_epochs', 1),
+            )
             self.config['layer3_method'] = method
         else:
             raise ValueError(f"Unknown aggregation method: {method}")

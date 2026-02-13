@@ -13,6 +13,7 @@ from .statistical import (
     StatisticalAnalyzer
 )
 from .robust_agg import TrimmedMeanAggregator, MultiKrumAggregator
+from .fltrust import FLTrustAggregator
 from .reputation import ReputationManager, EnhancedReputationManager, ClientStatus, BehaviorScore
 from .layer5_galaxy import (
     Layer5GalaxyDefense,
@@ -32,6 +33,7 @@ __all__ = [
     # Robust aggregation
     'TrimmedMeanAggregator',
     'MultiKrumAggregator',
+    'FLTrustAggregator',
     # Reputation
     'ReputationManager',
     'EnhancedReputationManager',

@@ -135,6 +135,14 @@ class CIFAR10CNN(nn.Module):
 _MODEL_REGISTRY['cifar10_cnn'] = CIFAR10CNN
 _MODEL_REGISTRY['cifar10'] = CIFAR10CNN
 
+# ResNet18 for CIFAR-10 (imported lazily to avoid circular deps)
+try:
+    from src.models.resnet import CIFAR10ResNet18
+    _MODEL_REGISTRY['resnet18'] = CIFAR10ResNet18
+    _MODEL_REGISTRY['cifar10_resnet18'] = CIFAR10ResNet18
+except ImportError:
+    pass  # torchvision may not be installed
+
 
 def create_model(model_type: str, **kwargs) -> nn.Module:
     """Create a model by type.
