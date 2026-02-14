@@ -76,6 +76,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -85,9 +86,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import psutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+
+try:
+    import GPUtil
+    _GPUTIL_AVAILABLE = True
+except ImportError:
+    _GPUTIL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Project imports
@@ -172,6 +180,82 @@ EVAL_MODES = (
     "zkp_performance", "attack_rejection", "full", "custom"
 )
 EVAL_TBD_PATH = PROJECT_ROOT / "eval_tbd.md"
+
+
+# ============================================================================
+# System Resource Monitor
+# ============================================================================
+
+class SystemResourceMonitor:
+    """Tracks CPU, GPU, and RAM usage during experiment execution.
+    
+    Samples system metrics in a background thread at configurable intervals.
+    Produces per-experiment and aggregate statistics suitable for paper tables.
+    """
+
+    def __init__(self, sample_interval: float = 1.0):
+        self.sample_interval = sample_interval
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._samples: List[Dict[str, float]] = []
+        self._process = psutil.Process(os.getpid())
+
+    def start(self):
+        """Begin background sampling."""
+        self._samples.clear()
+        self._running = True
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> Dict[str, Any]:
+        """Stop sampling and return aggregated stats."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        return self._aggregate()
+
+    def _sample_loop(self):
+        while self._running:
+            sample: Dict[str, float] = {
+                'timestamp': time.time(),
+                'cpu_percent': self._process.cpu_percent(interval=0),
+                'ram_mb': self._process.memory_info().rss / (1024 * 1024),
+                'ram_percent': self._process.memory_percent(),
+            }
+            # GPU metrics
+            if torch.cuda.is_available():
+                sample['gpu_mem_allocated_mb'] = torch.cuda.memory_allocated() / (1024 * 1024)
+                sample['gpu_mem_reserved_mb'] = torch.cuda.memory_reserved() / (1024 * 1024)
+                if _GPUTIL_AVAILABLE:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        sample['gpu_util_percent'] = gpus[0].load * 100
+                        sample['gpu_mem_util_percent'] = gpus[0].memoryUtil * 100
+                        sample['gpu_temp_c'] = gpus[0].temperature
+            self._samples.append(sample)
+            time.sleep(self.sample_interval)
+
+    def _aggregate(self) -> Dict[str, Any]:
+        if not self._samples:
+            return {'num_samples': 0}
+
+        keys_to_agg = [
+            'cpu_percent', 'ram_mb', 'ram_percent',
+            'gpu_mem_allocated_mb', 'gpu_mem_reserved_mb',
+            'gpu_util_percent', 'gpu_mem_util_percent', 'gpu_temp_c',
+        ]
+        stats: Dict[str, Any] = {'num_samples': len(self._samples)}
+        for key in keys_to_agg:
+            values = [s[key] for s in self._samples if key in s]
+            if values:
+                stats[key] = {
+                    'mean': float(np.mean(values)),
+                    'max': float(np.max(values)),
+                    'min': float(np.min(values)),
+                    'std': float(np.std(values)),
+                }
+        return stats
 
 
 # ============================================================================
@@ -303,6 +387,9 @@ class ExperimentResult:
     # Reputation snapshot
     final_reputations: Dict[int, float] = field(default_factory=dict)
 
+    # System resource usage
+    resource_usage: Dict[str, Any] = field(default_factory=dict)
+
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def compute_aggregates(self):
@@ -355,6 +442,7 @@ class ExperimentResult:
             "avg_merkle_time": self.avg_merkle_time,
             "total_bytes": self.total_bytes,
             "final_reputations": {str(k): v for k, v in self.final_reputations.items()},
+            "resource_usage": self.resource_usage,
             "timestamp": self.timestamp,
             "rounds": [asdict(r) for r in self.rounds],
         }
@@ -573,10 +661,15 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     result = ExperimentResult(config=cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Start resource monitoring
+    resource_monitor = SystemResourceMonitor(sample_interval=2.0)
+    resource_monitor.start()
+
     logger.info(
         f"[{cfg.experiment_id}] Starting — defense={cfg.defense} attack={cfg.attack} "
         f"clients={cfg.num_clients} galaxies={cfg.num_galaxies} rounds={cfg.num_rounds} "
-        f"byzantine={cfg.byzantine_fraction:.0%} partition={cfg.partition} seed={cfg.seed}"
+        f"byzantine={cfg.byzantine_fraction:.0%} partition={cfg.partition} seed={cfg.seed} "
+        f"device={device}"
     )
 
     # ── 1. Load data ───────────────────────────────────────────────────
@@ -788,6 +881,9 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             )
 
     # ── 6. Finalize results ────────────────────────────────────────────
+    # Stop resource monitoring and collect stats
+    result.resource_usage = resource_monitor.stop()
+
     # Collect final reputation scores if pipeline exists
     if pipeline is not None:
         for gid, coord in pipeline.galaxy_defense_coordinators.items():
@@ -796,11 +892,23 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
 
     result.compute_aggregates()
 
+    # Log resource summary
+    ru = result.resource_usage
+    res_summary = ""
+    if 'cpu_percent' in ru:
+        res_summary += f"cpu_avg={ru['cpu_percent']['mean']:.1f}% "
+    if 'ram_mb' in ru:
+        res_summary += f"ram_peak={ru['ram_mb']['max']:.0f}MB "
+    if 'gpu_util_percent' in ru:
+        res_summary += f"gpu_avg={ru['gpu_util_percent']['mean']:.1f}% "
+    if 'gpu_mem_allocated_mb' in ru:
+        res_summary += f"vram_peak={ru['gpu_mem_allocated_mb']['max']:.0f}MB "
+
     logger.info(
         f"[{cfg.experiment_id}] Done — final_acc={result.final_accuracy:.4f} "
         f"best_acc={result.best_accuracy:.4f} "
         f"avg_tpr={result.avg_tpr:.3f} avg_fpr={result.avg_fpr:.3f} "
-        f"time={result.total_time:.1f}s"
+        f"time={result.total_time:.1f}s {res_summary}"
     )
 
     # Cleanup
@@ -1316,8 +1424,8 @@ def run_zkp_performance_evaluation(trials: int, output_dir: str) -> bool:
     print("="*70 + "\n")
     
     evaluator = ZKPPerformanceEvaluator(num_trials=trials)
-    evaluator.run_full_benchmark()
-    evaluator.print_results_table()
+    evaluator.run_full_evaluation()
+    evaluator.print_summary_table()
     
     # Save results
     output_path = Path(output_dir) / "zkp_performance"
@@ -1401,6 +1509,133 @@ def print_summary(results: List[ExperimentResult]):
 
     print("=" * len(header))
     print(f"Total experiments: {len(results)}")
+
+
+def save_resource_report(results: List[ExperimentResult], output_dir: str):
+    """Save detailed resource usage report for all experiments.
+    
+    Writes a human-readable text file and a JSON summary with:
+    - Per-experiment wall-clock time, CPU, RAM, GPU usage
+    - Aggregate statistics across all experiments
+    - Suitable for inclusion in paper methodology section
+    """
+    report_path = Path(output_dir) / "resource_usage_report.txt"
+    json_path = Path(output_dir) / "resource_usage_report.json"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    device_name = "CPU"
+    if torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+
+    lines = [
+        "=" * 90,
+        "  SYSTEM RESOURCE USAGE REPORT",
+        "=" * 90,
+        f"  Date:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Device:     {device_name}",
+        f"  CPU Cores:  {psutil.cpu_count(logical=False)} physical / {psutil.cpu_count(logical=True)} logical",
+        f"  Total RAM:  {psutil.virtual_memory().total / (1024**3):.1f} GB",
+    ]
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        lines.append(f"  GPU VRAM:   {gpu_mem:.1f} GB")
+    lines.append("=" * 90)
+    lines.append("")
+
+    # Per-experiment header
+    lines.append(
+        f"{'Experiment':<55} {'Time(s)':>8} {'CPU%':>7} {'RAM(MB)':>9} "
+        f"{'GPU%':>7} {'VRAM(MB)':>9}"
+    )
+    lines.append("-" * 100)
+
+    json_records = []
+    all_times = []
+    all_cpus = []
+    all_rams = []
+    all_gpus = []
+    all_vrams = []
+
+    for r in results:
+        ru = r.resource_usage
+        wall = r.total_time
+        cpu_avg = ru.get('cpu_percent', {}).get('mean', 0)
+        ram_peak = ru.get('ram_mb', {}).get('max', 0)
+        gpu_avg = ru.get('gpu_util_percent', {}).get('mean', 0)
+        vram_peak = ru.get('gpu_mem_allocated_mb', {}).get('max', 0)
+
+        all_times.append(wall)
+        all_cpus.append(cpu_avg)
+        all_rams.append(ram_peak)
+        all_gpus.append(gpu_avg)
+        all_vrams.append(vram_peak)
+
+        eid = r.config.experiment_id
+        lines.append(
+            f"{eid:<55} {wall:>7.1f}s {cpu_avg:>6.1f}% {ram_peak:>8.0f} "
+            f"{gpu_avg:>6.1f}% {vram_peak:>8.0f}"
+        )
+
+        json_records.append({
+            'experiment_id': eid,
+            'defense': r.config.defense,
+            'attack': r.config.attack,
+            'num_clients': r.config.num_clients,
+            'final_accuracy': r.final_accuracy,
+            'wall_time_s': round(wall, 2),
+            'cpu_percent_avg': round(cpu_avg, 1),
+            'ram_peak_mb': round(ram_peak, 1),
+            'gpu_util_percent_avg': round(gpu_avg, 1),
+            'vram_peak_mb': round(vram_peak, 1),
+            'resource_detail': ru,
+        })
+
+    lines.append("-" * 100)
+
+    # Aggregate
+    if all_times:
+        lines.append("")
+        lines.append("AGGREGATE STATISTICS")
+        lines.append(f"  Total wall-clock time:    {sum(all_times):.1f}s ({sum(all_times)/60:.1f} min)")
+        lines.append(f"  Avg wall-clock per exp:   {np.mean(all_times):.1f}s")
+        lines.append(f"  CPU usage (avg/max):      {np.mean(all_cpus):.1f}% / {max(all_cpus):.1f}%")
+        lines.append(f"  RAM peak (avg/max):       {np.mean(all_rams):.0f} MB / {max(all_rams):.0f} MB")
+        if any(g > 0 for g in all_gpus):
+            lines.append(f"  GPU util (avg/max):       {np.mean(all_gpus):.1f}% / {max(all_gpus):.1f}%")
+            lines.append(f"  VRAM peak (avg/max):      {np.mean(all_vrams):.0f} MB / {max(all_vrams):.0f} MB")
+
+    lines.append("")
+    lines.append("=" * 90)
+
+    report_text = "\n".join(lines)
+    with open(report_path, 'w') as f:
+        f.write(report_text)
+
+    json_report = {
+        'system': {
+            'device': device_name,
+            'cpu_cores_physical': psutil.cpu_count(logical=False),
+            'cpu_cores_logical': psutil.cpu_count(logical=True),
+            'total_ram_gb': round(psutil.virtual_memory().total / (1024**3), 1),
+            'gpu_vram_gb': round(torch.cuda.get_device_properties(0).total_mem / (1024**3), 1) if torch.cuda.is_available() else 0,
+        },
+        'aggregate': {
+            'total_time_s': round(sum(all_times), 1) if all_times else 0,
+            'avg_time_s': round(float(np.mean(all_times)), 1) if all_times else 0,
+            'avg_cpu_percent': round(float(np.mean(all_cpus)), 1) if all_cpus else 0,
+            'max_ram_mb': round(float(max(all_rams)), 1) if all_rams else 0,
+            'avg_gpu_percent': round(float(np.mean(all_gpus)), 1) if all_gpus else 0,
+            'max_vram_mb': round(float(max(all_vrams)), 1) if all_vrams else 0,
+        },
+        'experiments': json_records,
+    }
+    with open(json_path, 'w') as f:
+        json.dump(json_report, f, indent=2, default=str)
+
+    print(f"\n  Resource report saved to:")
+    print(f"    {report_path}")
+    print(f"    {json_path}")
+    return report_text
 
 
 # ============================================================================
@@ -1508,6 +1743,12 @@ def main():
     print(f"  Experiments:  {len(configs)}")
     print(f"  Trials/cfg:  {args.trials}")
     print(f"  Output:      {args.output_dir}")
+    print(f"  Device:      {'cuda (' + torch.cuda.get_device_name(0) + ')' if torch.cuda.is_available() else 'cpu'}")
+    print(f"  CPU Cores:   {psutil.cpu_count(logical=False)} physical / {psutil.cpu_count(logical=True)} logical")
+    print(f"  Total RAM:   {psutil.virtual_memory().total / (1024**3):.1f} GB")
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        print(f"  GPU VRAM:    {gpu_mem:.1f} GB")
     print("=" * 70)
 
     if args.dry_run:
@@ -1549,6 +1790,10 @@ def main():
 
     # Summary
     print_summary(all_results)
+
+    # Save resource usage report
+    if all_results:
+        save_resource_report(all_results, args.output_dir)
 
     if failed:
         print(f"\n  ⚠ {len(failed)} experiments failed or skipped:")
