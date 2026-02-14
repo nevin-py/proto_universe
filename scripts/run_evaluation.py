@@ -1617,7 +1617,7 @@ def save_resource_report(results: List[ExperimentResult], output_dir: str):
             'cpu_cores_physical': psutil.cpu_count(logical=False),
             'cpu_cores_logical': psutil.cpu_count(logical=True),
             'total_ram_gb': round(psutil.virtual_memory().total / (1024**3), 1),
-            'gpu_vram_gb': round(torch.cuda.get_device_properties(0).total_mem / (1024**3), 1) if torch.cuda.is_available() else 0,
+            'gpu_vram_gb': round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1) if torch.cuda.is_available() else 0,
         },
         'aggregate': {
             'total_time_s': round(sum(all_times), 1) if all_times else 0,
@@ -1747,7 +1747,7 @@ def main():
     print(f"  CPU Cores:   {psutil.cpu_count(logical=False)} physical / {psutil.cpu_count(logical=True)} logical")
     print(f"  Total RAM:   {psutil.virtual_memory().total / (1024**3):.1f} GB")
     if torch.cuda.is_available():
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"  GPU VRAM:    {gpu_mem:.1f} GB")
     print("=" * 70)
 
