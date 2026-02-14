@@ -469,12 +469,20 @@ def _set_seed(seed: int):
 
 def _load_dataset(name: str, data_dir: str = "./data"):
     """Load train/test datasets using src.data.datasets loaders."""
+    logger.info(f"Loading dataset '{name}' from {data_dir}")
+    load_start = time.perf_counter()
     if name == "mnist":
-        return _load_mnist(data_dir=os.path.join(data_dir, "mnist"))
+        train_ds, test_ds = _load_mnist(data_dir=os.path.join(data_dir, "mnist"))
     elif name == "cifar10":
-        return _load_cifar10(data_dir=os.path.join(data_dir, "cifar10"))
+        train_ds, test_ds = _load_cifar10(data_dir=os.path.join(data_dir, "cifar10"))
     else:
         raise ValueError(f"Unknown dataset: {name}")
+    elapsed = time.perf_counter() - load_start
+    logger.info(
+        f"Dataset '{name}' loaded in {elapsed:.2f}s — "
+        f"train={len(train_ds)} samples, test={len(test_ds)} samples"
+    )
+    return train_ds, test_ds
 
 
 def _partition_data(
@@ -496,7 +504,16 @@ def _partition_data(
     else:
         raise ValueError(f"Unknown partition method: {method}")
 
-    return partitioner.partition(dataset, num_clients)
+    part_start = time.perf_counter()
+    partitions = partitioner.partition(dataset, num_clients)
+    elapsed = time.perf_counter() - part_start
+    sizes = [len(v) for v in partitions.values()]
+    logger.info(
+        f"Partitioned {len(dataset)} samples across {num_clients} clients "
+        f"(method={method}, {elapsed:.2f}s) — "
+        f"min={min(sizes)}, max={max(sizes)}, avg={np.mean(sizes):.0f} samples/client"
+    )
+    return partitions
 
 
 def _create_model(dataset: str, model_type: str) -> nn.Module:
@@ -664,15 +681,25 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     # Start resource monitoring
     resource_monitor = SystemResourceMonitor(sample_interval=2.0)
     resource_monitor.start()
+    logger.debug("SystemResourceMonitor started (interval=2.0s)")
 
-    logger.info(
-        f"[{cfg.experiment_id}] Starting — defense={cfg.defense} attack={cfg.attack} "
-        f"clients={cfg.num_clients} galaxies={cfg.num_galaxies} rounds={cfg.num_rounds} "
-        f"byzantine={cfg.byzantine_fraction:.0%} partition={cfg.partition} seed={cfg.seed} "
-        f"device={device}"
-    )
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info(f"EXPERIMENT: {cfg.experiment_id}")
+    logger.info("=" * 72)
+    logger.info(f"  Defense:      {cfg.defense} (agg={cfg.aggregation_method})")
+    logger.info(f"  Attack:       {cfg.attack} (byzantine={cfg.byzantine_fraction:.0%}, scale={cfg.attack_scale})")
+    logger.info(f"  FL Setup:     {cfg.num_clients} clients, {cfg.num_galaxies} galaxies, {cfg.num_rounds} rounds")
+    logger.info(f"  Training:     lr={cfg.learning_rate}, batch={cfg.batch_size}, local_epochs={cfg.local_epochs}")
+    logger.info(f"  Data:         {cfg.dataset} / {cfg.model_type} / {cfg.partition}")
+    logger.info(f"  Seed:         {cfg.seed}, trial={cfg.trial_id}")
+    logger.info(f"  Device:       {device}")
+    if cfg.ablation:
+        logger.info(f"  Ablation:     {cfg.ablation}")
+    logger.info("-" * 72)
 
     # ── 1. Load data ───────────────────────────────────────────────────
+    logger.info("[Phase: DATA] Loading dataset and partitioning...")
     train_dataset, test_dataset = _load_dataset(cfg.dataset)
     partitions = _partition_data(
         train_dataset, cfg.num_clients, cfg.partition, cfg.seed,
@@ -684,19 +711,34 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     test_loader = create_test_loader(test_dataset, batch_size=256)
 
     # ── 2. Create model ───────────────────────────────────────────────
+    logger.info("[Phase: MODEL] Creating and initializing model...")
     global_model = _create_model(cfg.dataset, cfg.model_type).to(device)
+    num_params = count_parameters(global_model)
     initial_accuracy = _evaluate_model(global_model, test_loader, device)
-    logger.info(f"  Model: {type(global_model).__name__} ({count_parameters(global_model)} params), "
-                f"initial acc={initial_accuracy:.2%}")
+    logger.info(
+        f"  Model:            {type(global_model).__name__}\n"
+        f"  Parameters:       {num_params:,}\n"
+        f"  Device:           {device}\n"
+        f"  Initial accuracy: {initial_accuracy:.4f} ({initial_accuracy:.2%})"
+    )
 
     # ── 3. Byzantine setup ─────────────────────────────────────────────
     num_byzantine = int(cfg.num_clients * cfg.byzantine_fraction)
     byzantine_ids: Set[int] = set(range(num_byzantine))
+    if num_byzantine > 0:
+        logger.info(
+            f"[Phase: BYZANTINE] {num_byzantine}/{cfg.num_clients} Byzantine clients "
+            f"({cfg.byzantine_fraction:.0%}) — IDs: {sorted(byzantine_ids)}"
+        )
+        logger.info(f"  Attack type: {cfg.attack}, scale={cfg.attack_scale}")
+    else:
+        logger.info("[Phase: BYZANTINE] No Byzantine clients (clean run)")
 
     # ── 4. Build pipeline or vanilla path ──────────────────────────────
+    logger.info(f"[Phase: DEFENSE] Configuring defense: {cfg.defense}")
     # Defense config passed to DefenseCoordinator inside ProtoGalaxyPipeline
     if cfg.defense == "vanilla":
-        # Vanilla FedAvg: no defense, simple averaging
+        logger.info("  Strategy: Vanilla FedAvg — no defense, simple averaging")
         pipeline = None  # We drive vanilla manually
     elif cfg.defense == "multi_krum":
         # Use ProtoGalaxy pipeline but set aggregation to multi_krum
@@ -710,6 +752,11 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             num_clients=cfg.num_clients,
             num_galaxies=cfg.num_galaxies,
             defense_config=defense_config,
+        )
+        logger.info(
+            f"  Strategy: Multi-Krum\n"
+            f"  krum_f={defense_config['layer3_krum_f']} (expected Byzantine), "
+            f"krum_m={defense_config['layer3_krum_m']} (selection count)"
         )
     elif cfg.defense == "fltrust":
         # FLTrust: use a small clean root dataset held by the server
@@ -736,6 +783,11 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             num_galaxies=cfg.num_galaxies,
             defense_config=defense_config,
         )
+        logger.info(
+            f"  Strategy: FLTrust\n"
+            f"  Server root dataset: {len(server_root_dataset)} samples\n"
+            f"  Trust scores computed per-round via cosine similarity"
+        )
     elif cfg.defense == "protogalaxy_full":
         defense_config = {
             "layer3_method": cfg.aggregation_method,
@@ -746,6 +798,14 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             num_clients=cfg.num_clients,
             num_galaxies=cfg.num_galaxies,
             defense_config=defense_config,
+        )
+        logger.info(
+            f"  Strategy: ProtoGalaxy Full 5-Layer Defense\n"
+            f"  L1: Commitment + Merkle Tree\n"
+            f"  L2: Statistical Analysis (z-score, MAD)\n"
+            f"  L3: Robust Aggregation ({cfg.aggregation_method}, trim={cfg.trim_ratio})\n"
+            f"  L4: Reputation Management\n"
+            f"  L5: ZKP Norm-Bounded Proofs (ProtoGalaxy IVC)"
         )
     else:
         raise ValueError(f"Unknown defense: {cfg.defense}")
@@ -760,6 +820,10 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             cos_threshold=0.3,
             attack_strength=2.0,
         )
+        logger.info(
+            "  Adaptive attacker initialized: window=5, norm_sigma=2.0, "
+            "cos_thresh=0.3, strength=2.0"
+        )
     elif cfg.attack == "sybil":
         sybil_coordinator = SybilCoordinator(
             sybil_ids=list(byzantine_ids),
@@ -767,13 +831,21 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             attack_scale=cfg.attack_scale,
             seed=cfg.seed,
         )
+        logger.info(
+            f"  Sybil coordinator initialized: strategy=synchronized, "
+            f"sybil_ids={sorted(byzantine_ids)}, scale={cfg.attack_scale}"
+        )
 
     # ── 5. Training loop ───────────────────────────────────────────────
+    logger.info("")
+    logger.info(f"[Phase: TRAINING] Starting FL training — {cfg.num_rounds} rounds")
+    logger.info("-" * 72)
     experiment_start = time.perf_counter()
 
     for round_num in range(cfg.num_rounds):
         rmetrics = RoundMetrics(round_num=round_num)
         round_start = time.perf_counter()
+        logger.debug(f"Round {round_num}/{cfg.num_rounds} — starting local training")
 
         # ── 5a. Local training ─────────────────────────────────────────
         client_trainers: Dict[int, Trainer] = {}
@@ -794,6 +866,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
                     attack_scale=cfg.attack_scale,
                     backdoor_scale=cfg.backdoor_scale,
                 )
+                logger.debug(f"    Client {cid}: injected {cfg.attack} attack (scale={cfg.attack_scale})")
 
             client_trainers[cid] = trainer
             client_grads[cid] = grads
@@ -873,14 +946,47 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         rmetrics.round_time = time.perf_counter() - round_start
         result.rounds.append(rmetrics)
 
+        # Detailed per-round log (every round to DEBUG, periodic to INFO)
+        round_log = (
+            f"Round {round_num:>3d}/{cfg.num_rounds}  "
+            f"acc={accuracy:.4f}  loss={rmetrics.loss:.4f}  "
+            f"TPR={rmetrics.tpr:.3f}  FPR={rmetrics.fpr:.3f}  "
+            f"prec={rmetrics.precision:.3f}  F1={rmetrics.f1:.3f}  "
+            f"flagged={len(rmetrics.flagged_client_ids)}  "
+            f"quar={len(rmetrics.quarantined_client_ids)}  "
+            f"banned={len(rmetrics.banned_client_ids)}"
+        )
+        timing_log = (
+            f"  timing: total={rmetrics.round_time:.2f}s  "
+            f"P1={rmetrics.phase1_time:.3f}s  P2={rmetrics.phase2_time:.3f}s  "
+            f"P3={rmetrics.phase3_time:.3f}s  P4={rmetrics.phase4_time:.3f}s"
+        )
+        zkp_log = (
+            f"  zkp: mode={rmetrics.zk_mode}  "
+            f"prove={rmetrics.zk_prove_time:.3f}s  verify={rmetrics.zk_verify_time:.3f}s  "
+            f"fold={rmetrics.zk_fold_time:.3f}s  "
+            f"gen={rmetrics.zk_proofs_generated}  ok={rmetrics.zk_proofs_verified}  "
+            f"fail={rmetrics.zk_proofs_failed}"
+        )
+        merkle_log = (
+            f"  merkle: build={rmetrics.merkle_build_time:.4f}s  "
+            f"verify={rmetrics.merkle_verify_time:.4f}s"
+        )
+
+        # Always log full detail to DEBUG
+        logger.debug(round_log)
+        logger.debug(timing_log)
+        logger.debug(zkp_log)
+        logger.debug(merkle_log)
+
+        # Periodic summary to INFO
         if round_num % max(1, cfg.num_rounds // 10) == 0 or round_num == cfg.num_rounds - 1:
-            logger.info(
-                f"  Round {round_num:>3d}/{cfg.num_rounds}: "
-                f"acc={accuracy:.4f}  tpr={rmetrics.tpr:.2f}  fpr={rmetrics.fpr:.2f}  "
-                f"time={rmetrics.round_time:.2f}s"
-            )
+            logger.info(round_log)
 
     # ── 6. Finalize results ────────────────────────────────────────────
+    logger.info("")
+    logger.info("[Phase: FINALIZE] Aggregating results and collecting metrics...")
+
     # Stop resource monitoring and collect stats
     result.resource_usage = resource_monitor.stop()
 
@@ -889,27 +995,59 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         for gid, coord in pipeline.galaxy_defense_coordinators.items():
             reps = coord.layer4.get_all_reputations()
             result.final_reputations.update(reps)
+        # Log reputation summary
+        if result.final_reputations:
+            rep_values = list(result.final_reputations.values())
+            logger.info(
+                f"  Reputation scores: min={min(rep_values):.3f}, "
+                f"max={max(rep_values):.3f}, avg={np.mean(rep_values):.3f}"
+            )
 
     result.compute_aggregates()
 
-    # Log resource summary
+    # Detailed experiment summary
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info(f"EXPERIMENT COMPLETE: {cfg.experiment_id}")
+    logger.info("=" * 72)
+    logger.info(f"  Accuracy:")
+    logger.info(f"    Final:   {result.final_accuracy:.4f} ({result.final_accuracy:.2%})")
+    logger.info(f"    Best:    {result.best_accuracy:.4f} ({result.best_accuracy:.2%})")
+    logger.info(f"    Initial: {initial_accuracy:.4f} ({initial_accuracy:.2%})")
+    logger.info(f"    Gain:    {result.final_accuracy - initial_accuracy:+.4f}")
+    logger.info(f"  Convergence:")
+    logger.info(f"    85%: round {result.convergence_round_85}")
+    logger.info(f"    90%: round {result.convergence_round_90}")
+    logger.info(f"    95%: round {result.convergence_round_95}")
+    if num_byzantine > 0:
+        logger.info(f"  Detection:")
+        logger.info(f"    Avg TPR (recall):  {result.avg_tpr:.4f}")
+        logger.info(f"    Avg FPR:           {result.avg_fpr:.4f}")
+        logger.info(f"    Avg Precision:     {result.avg_precision:.4f}")
+        logger.info(f"    Avg F1:            {result.avg_f1:.4f}")
+    logger.info(f"  Timing:")
+    logger.info(f"    Total:             {result.total_time:.2f}s ({result.total_time/60:.1f} min)")
+    logger.info(f"    Avg round:         {result.avg_round_time:.3f}s")
+    logger.info(f"    Avg ZK prove:      {result.avg_zk_prove_time:.4f}s")
+    logger.info(f"    Avg ZK verify:     {result.avg_zk_verify_time:.4f}s")
+    logger.info(f"    Avg Merkle:        {result.avg_merkle_time:.4f}s")
+    logger.info(f"  Communication:")
+    logger.info(f"    Total bytes:       {result.total_bytes:,} ({result.total_bytes/(1024**2):.1f} MB)")
+    # Resource summary
     ru = result.resource_usage
-    res_summary = ""
-    if 'cpu_percent' in ru:
-        res_summary += f"cpu_avg={ru['cpu_percent']['mean']:.1f}% "
-    if 'ram_mb' in ru:
-        res_summary += f"ram_peak={ru['ram_mb']['max']:.0f}MB "
-    if 'gpu_util_percent' in ru:
-        res_summary += f"gpu_avg={ru['gpu_util_percent']['mean']:.1f}% "
-    if 'gpu_mem_allocated_mb' in ru:
-        res_summary += f"vram_peak={ru['gpu_mem_allocated_mb']['max']:.0f}MB "
-
-    logger.info(
-        f"[{cfg.experiment_id}] Done — final_acc={result.final_accuracy:.4f} "
-        f"best_acc={result.best_accuracy:.4f} "
-        f"avg_tpr={result.avg_tpr:.3f} avg_fpr={result.avg_fpr:.3f} "
-        f"time={result.total_time:.1f}s {res_summary}"
-    )
+    if ru.get('num_samples', 0) > 0:
+        logger.info(f"  Resources ({ru['num_samples']} samples):")
+        if 'cpu_percent' in ru:
+            logger.info(f"    CPU:   avg={ru['cpu_percent']['mean']:.1f}%, max={ru['cpu_percent']['max']:.1f}%")
+        if 'ram_mb' in ru:
+            logger.info(f"    RAM:   avg={ru['ram_mb']['mean']:.0f} MB, peak={ru['ram_mb']['max']:.0f} MB")
+        if 'gpu_util_percent' in ru:
+            logger.info(f"    GPU:   avg={ru['gpu_util_percent']['mean']:.1f}%, max={ru['gpu_util_percent']['max']:.1f}%")
+        if 'gpu_mem_allocated_mb' in ru:
+            logger.info(f"    VRAM:  avg={ru['gpu_mem_allocated_mb']['mean']:.0f} MB, peak={ru['gpu_mem_allocated_mb']['max']:.0f} MB")
+        if 'gpu_temp_c' in ru:
+            logger.info(f"    Temp:  avg={ru['gpu_temp_c']['mean']:.0f}°C, max={ru['gpu_temp_c']['max']:.0f}°C")
+    logger.info("=" * 72)
 
     # Cleanup
     del global_model, client_trainers, client_grads
@@ -950,6 +1088,7 @@ def _run_vanilla_round(
 
     rmetrics.zk_mode = "NONE"
     rmetrics.flagged_client_ids = []
+    logger.debug("  Vanilla round: averaged %d client gradient sets", len(client_grads))
     return rmetrics
 
 
@@ -999,6 +1138,10 @@ def _run_fltrust_round(
         rmetrics.flagged_client_ids = []
 
     rmetrics.zk_mode = "NONE"
+    logger.debug(
+        "  FLTrust round: %d clients, flagged=%s",
+        len(client_grads), rmetrics.flagged_client_ids
+    )
     return rmetrics
 
 
@@ -1022,6 +1165,10 @@ def _run_protogalaxy_round(
     """
     pipeline.current_round = round_num
     enable_zkp = cfg.ablation != "merkle_only"
+    logger.debug(
+        f"  ProtoGalaxy round {round_num}: zkp={'ON' if enable_zkp else 'OFF'}, "
+        f"ablation={cfg.ablation or 'none'}"
+    )
 
     # ==========================
     # PHASE 1: COMMITMENT
@@ -1074,6 +1221,12 @@ def _run_protogalaxy_round(
     rmetrics.merkle_verify_time = time.perf_counter() - merkle_verify_start
 
     rmetrics.phase1_time = time.perf_counter() - phase1_start
+    logger.debug(
+        f"  Phase 1 COMMIT: {rmetrics.phase1_time:.3f}s — "
+        f"merkle_build={rmetrics.merkle_build_time:.4f}s, "
+        f"merkle_verify={rmetrics.merkle_verify_time:.4f}s, "
+        f"zk_prove={rmetrics.zk_prove_time:.3f}s ({rmetrics.zk_proofs_generated} proofs)"
+    )
 
     # ==========================
     # PHASE 2: REVELATION
@@ -1117,6 +1270,11 @@ def _run_protogalaxy_round(
                 ]
 
     rmetrics.phase2_time = time.perf_counter() - phase2_start
+    logger.debug(
+        f"  Phase 2 REVEAL: {rmetrics.phase2_time:.3f}s — "
+        f"verified={total_verified}, zk_ok={rmetrics.zk_proofs_verified}, "
+        f"zk_fail={rmetrics.zk_proofs_failed}"
+    )
 
     # ==========================
     # PHASE 3: DEFENSE
@@ -1153,6 +1311,11 @@ def _run_protogalaxy_round(
         galaxy_submissions[galaxy_id] = galaxy_sub
 
     rmetrics.phase3_time = time.perf_counter() - phase3_start
+    logger.debug(
+        f"  Phase 3 DEFENSE: {rmetrics.phase3_time:.3f}s — "
+        f"{len(galaxy_agg_grads)} galaxies aggregated, "
+        f"flagged={sorted(round_flagged)}"
+    )
 
     # ==========================
     # PHASE 4: GLOBAL AGGREGATION
@@ -1187,6 +1350,12 @@ def _run_protogalaxy_round(
     pipeline.phase4_distribute_model()
 
     rmetrics.phase4_time = time.perf_counter() - phase4_start
+    logger.debug(
+        f"  Phase 4 GLOBAL: {rmetrics.phase4_time:.3f}s — "
+        f"verified_galaxies={len(verified_galaxies)}, "
+        f"rejected_galaxies={len(rejected_galaxies)}, "
+        f"zk_fold={rmetrics.zk_fold_time:.3f}s"
+    )
 
     # Collect reputation data for quarantine/ban
     rmetrics.flagged_client_ids = sorted(round_flagged)
@@ -1537,7 +1706,7 @@ def save_resource_report(results: List[ExperimentResult], output_dir: str):
         f"  Total RAM:  {psutil.virtual_memory().total / (1024**3):.1f} GB",
     ]
     if torch.cuda.is_available():
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         lines.append(f"  GPU VRAM:   {gpu_mem:.1f} GB")
     lines.append("=" * 90)
     lines.append("")
@@ -1688,13 +1857,30 @@ def main():
 
     args = parser.parse_args()
 
-    # Logging
+    # Logging — dual output: console + file
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    log_dir = Path(args.output_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"eval_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    # Console handler — concise
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+    ))
+    root_logger.addHandler(console_handler)
+    # File handler — detailed with timestamps
+    file_handler = logging.FileHandler(str(log_file), mode='w')
+    file_handler.setLevel(logging.DEBUG)  # Always capture DEBUG to file
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    root_logger.addHandler(file_handler)
+    logger.info(f"Log file: {log_file}")
 
     # Build experiment matrix
     custom_cfg = None
