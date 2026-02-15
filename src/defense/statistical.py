@@ -39,9 +39,9 @@ class StatisticalAnalyzer:
     
     def __init__(
         self,
-        norm_threshold_sigma: float = 3.0,
+        norm_threshold_sigma: float = 4.5,
         cosine_threshold: float = 0.5,
-        coordinate_threshold_sigma: float = 3.0,
+        coordinate_threshold_sigma: float = 4.5,
         kl_divergence_threshold: float = 2.0,
         min_failures_to_flag: int = 2
     ):

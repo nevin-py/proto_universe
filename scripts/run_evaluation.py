@@ -858,18 +858,32 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             trainer.train(loader, num_epochs=cfg.local_epochs)
             grads = trainer.get_gradients()
 
+            # Optimization: Move gradients to CPU immediately to save GPU memory
+            # This is critical for large-scale experiments (100+ clients)
+            cpu_grads = [g.cpu() for g in grads]
+
             # Inject attack for Byzantine clients (skip adaptive/sybil here —
             # they are handled after all clients train so they can see honest grads)
             if cid in byzantine_ids and cfg.attack not in ("none", "adaptive", "sybil"):
-                grads = _inject_attack(
-                    grads, cfg.attack, cid,
+                cpu_grads = _inject_attack(
+                    cpu_grads, cfg.attack, cid,
                     attack_scale=cfg.attack_scale,
                     backdoor_scale=cfg.backdoor_scale,
                 )
                 logger.debug(f"    Client {cid}: injected {cfg.attack} attack (scale={cfg.attack_scale})")
 
             client_trainers[cid] = trainer
-            client_grads[cid] = grads
+            client_grads[cid] = cpu_grads
+
+            # Move model to CPU to save GPU memory
+            trainer.model.cpu()
+            # Clear optimizer state if it takes memory (optional but good practice)
+            # trainer.optimizer = None 
+
+            # Clear GPU cache after each client to prevent fragmentation
+            # Clear GPU cache periodically to prevent fragmentation (every 10 clients)
+            if torch.cuda.is_available() and (cid + 1) % 10 == 0:
+                torch.cuda.empty_cache()
 
         # ── 5a-post. Adaptive / Sybil attack (needs all honest grads) ─
         if cfg.attack == "adaptive" and adaptive_attacker is not None:
@@ -1183,6 +1197,11 @@ def _run_protogalaxy_round(
         commit_hash, metadata = pipeline.phase1_client_commitment(
             cid, grads, round_num,
         )
+        # Move metadata tensors to CPU if they exist
+        for k, v in metadata.items():
+            if isinstance(v, torch.Tensor):
+                metadata[k] = v.cpu()
+
         client_metadata[cid] = metadata
         galaxy_id = cid % cfg.num_galaxies
         commitments_by_galaxy.setdefault(galaxy_id, {})[cid] = commit_hash
@@ -1207,6 +1226,11 @@ def _run_protogalaxy_round(
         rmetrics.zk_mode = zk_metrics.get("mode", "NONE")
     else:
         rmetrics.zk_mode = "DISABLED"
+        
+    # Free memory after ZKP generation (if any GPU tensors were created)
+    # Free memory after ZKP generation (if any GPU tensors were created)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Client-side Merkle verification
     merkle_verify_start = time.perf_counter()
@@ -1449,6 +1473,7 @@ def _gen_ablation_configs(
 
 def _gen_scalability_configs(
     trials: int, base_seed: int, num_rounds: int,
+    dataset: str = "mnist", model_type: str = "linear",
 ) -> List[ExperimentConfig]:
     """Scalability: vary clients × galaxies across defenses and attacks."""
     scale_points = [
@@ -1484,6 +1509,8 @@ def _gen_scalability_configs(
                         aggregation_method=agg,
                         byzantine_fraction=byz_frac,
                         num_rounds=min(num_rounds, 15),  # shorter for large scale
+                        dataset=dataset,
+                        model_type=model_type,
                     ))
     return configs
 
@@ -1493,6 +1520,8 @@ def generate_experiment_matrix(
     trials: int = 3,
     base_seed: int = 42,
     num_rounds: int = 20,
+    dataset: str = "mnist",
+    model_type: str = "linear",
     custom_cfg: Optional[ExperimentConfig] = None,
 ) -> List[ExperimentConfig]:
     """Generate the experiment matrix for a given mode.
@@ -1518,7 +1547,7 @@ def generate_experiment_matrix(
     if mode == "ablation":
         return _gen_ablation_configs(trials, base_seed, num_rounds)
     if mode == "scalability":
-        return _gen_scalability_configs(trials, base_seed, num_rounds)
+        return _gen_scalability_configs(trials, base_seed, num_rounds, dataset, model_type)
     if mode == "zkp_performance":
         # ZKP performance mode uses specialized evaluator, return empty list
         return []
@@ -1530,7 +1559,7 @@ def generate_experiment_matrix(
             _gen_baseline_configs(trials, base_seed, num_rounds)
             + _gen_attack_configs(trials, base_seed, num_rounds)
             + _gen_ablation_configs(trials, base_seed, num_rounds)
-            + _gen_scalability_configs(trials, base_seed, num_rounds)
+            + _gen_scalability_configs(trials, base_seed, num_rounds, dataset, model_type)
         )
     if mode == "custom":
         if custom_cfg is None:
@@ -1910,6 +1939,8 @@ def main():
         trials=args.trials,
         base_seed=args.base_seed,
         num_rounds=args.num_rounds,
+        dataset=args.dataset,
+        model_type=args.model_type,
         custom_cfg=custom_cfg,
     )
 

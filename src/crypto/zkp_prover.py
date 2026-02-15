@@ -145,10 +145,12 @@ class GradientSumCheckProver:
             bounds_enforced=bounds_enforced,
         )
 
+        return thresholds
+    
     def _compute_norm_thresholds(self, gradients: List[torch.Tensor]) -> List[float]:
-        """Compute per-layer norm thresholds from gradient statistics.
+        """Compute per-layer norm thresholds from gradient sum statistics.
         
-        Uses robust statistics: For each layer, threshold = scale_factor * layer_norm
+        Uses robust statistics: For each layer, threshold = scale_factor * abs(layer_sum)
         In production, this would use historical statistics (median + k*MAD across clients).
         
         Args:
@@ -159,16 +161,17 @@ class GradientSumCheckProver:
         """
         thresholds = []
         for grad in gradients:
-            # Compute L2 norm of the layer's gradient
-            layer_norm = torch.norm(grad).item()
+            # FIX: Use absolute sum instead of L2 norm for threshold
+            # The prover checks sum(grad)^2 <= threshold^2
+            layer_sum = grad.sum().item()
             
-            # Set threshold as multiple of current norm
+            # Set threshold as multiple of current sum magnitude
             # In production: use robust statistics from honest gradient history
-            # threshold = median(honest_norms) + k * MAD(honest_norms)
-            threshold = abs(layer_norm) * self._norm_scale_factor
+            threshold = abs(layer_sum) * self._norm_scale_factor
             
-            # Ensure minimum threshold to avoid division by zero
-            threshold = max(threshold, 1e-6)
+            # Ensure minimum threshold to avoid division by zero or overly tight bounds
+            # For 0-sum gradients (e.g. dead neurons), use small epsilon
+            threshold = max(threshold, 1e-4)
             
             thresholds.append(threshold)
         
