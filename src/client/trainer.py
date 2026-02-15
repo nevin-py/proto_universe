@@ -26,7 +26,8 @@ class Trainer:
         learning_rate: float = 0.01,
         momentum: float = 0.9,
         weight_decay: float = 0.0,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        use_amp: bool = False
     ):
         """Initialize trainer with model and hyperparameters.
         
@@ -36,6 +37,7 @@ class Trainer:
             momentum: Momentum for SGD optimizer
             weight_decay: L2 regularization weight
             device: Device to train on ('cuda', 'cpu', or None for auto)
+            use_amp: Whether to use Automatic Mixed Precision
         """
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
@@ -50,6 +52,10 @@ class Trainer:
             weight_decay=weight_decay
         )
         self.criterion = nn.CrossEntropyLoss()
+        
+        # AMP scaler
+        self.use_amp = use_amp and torch.cuda.is_available() and self.device != 'cpu'
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
         
         # Store initial weights for computing gradients
         self._initial_weights: Optional[List[torch.Tensor]] = None
@@ -94,10 +100,20 @@ class Trainer:
                 labels = labels.to(self.device)
                 
                 self.optimizer.zero_grad()
-                outputs = self.model(data)
-                loss = self.criterion(outputs, labels)
-                loss.backward()
-                self.optimizer.step()
+                
+                if self.use_amp and self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(data)
+                        loss = self.criterion(outputs, labels)
+                    
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = self.model(data)
+                    loss = self.criterion(outputs, labels)
+                    loss.backward()
+                    self.optimizer.step()
                 
                 # Track metrics
                 batch_size = data.size(0)

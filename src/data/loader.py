@@ -18,7 +18,8 @@ def create_client_loaders(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 0,
-    pin_memory: bool = False
+    pin_memory: bool = False,
+    prefetch_factor: Optional[int] = None
 ) -> Dict[int, DataLoader]:
     """Create DataLoaders for each client.
     
@@ -29,11 +30,16 @@ def create_client_loaders(
         shuffle: Whether to shuffle data
         num_workers: Number of data loading workers
         pin_memory: Whether to pin memory for GPU
+        prefetch_factor: Number of batches to prefetch (if num_workers > 0)
         
     Returns:
         Dictionary mapping client_id to DataLoader
     """
     client_loaders = {}
+    
+    # Only use prefetch_factor and persistent_workers if num_workers > 0
+    pf = prefetch_factor if num_workers > 0 else None
+    pw = (num_workers > 0)
     
     for client_id, indices in partitions.items():
         client_subset = Subset(dataset, indices)
@@ -44,6 +50,8 @@ def create_client_loaders(
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            prefetch_factor=pf,
+            persistent_workers=pw,
             drop_last=False
         )
         
@@ -57,23 +65,16 @@ def create_galaxy_loaders(
     partitions: Dict[int, List[int]],
     galaxy_assignments: Dict[int, int],
     batch_size: int = 32,
-    shuffle: bool = True
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: Optional[int] = None
 ) -> Dict[int, Dict[int, DataLoader]]:
-    """Create DataLoaders organized by galaxy.
-    
-    Args:
-        dataset: Full dataset
-        partitions: Client partitions
-        galaxy_assignments: Mapping of client_id to galaxy_id
-        batch_size: Batch size
-        shuffle: Whether to shuffle
-        
-    Returns:
-        Nested dict: galaxy_id -> client_id -> DataLoader
-    """
+    """Create DataLoaders organized by galaxy."""
     # First create all client loaders
     client_loaders = create_client_loaders(
-        dataset, partitions, batch_size, shuffle
+        dataset, partitions, batch_size, shuffle,
+        num_workers=num_workers, pin_memory=pin_memory, prefetch_factor=prefetch_factor
     )
     
     # Organize by galaxy
@@ -93,7 +94,9 @@ def create_galaxy_loaders(
 def create_test_loader(
     dataset: Dataset,
     batch_size: int = 64,
-    num_workers: int = 0
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: Optional[int] = None
 ) -> DataLoader:
     """Create a DataLoader for test data.
     
@@ -101,15 +104,23 @@ def create_test_loader(
         dataset: Test dataset
         batch_size: Batch size
         num_workers: Number of workers
+        pin_memory: Pin memory
+        prefetch_factor: Prefetch factor
         
     Returns:
         DataLoader for evaluation
     """
+    pf = prefetch_factor if num_workers > 0 else None
+    pw = (num_workers > 0)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=pf,
+        persistent_workers=pw
     )
 
 

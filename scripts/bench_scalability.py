@@ -46,6 +46,11 @@ def generate_scalability_configs(
     base_seed: int,
     num_rounds: int,
     local_epochs: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int,
+    use_amp: bool,
 ) -> List[ExperimentConfig]:
     """Generate experiment configurations for scalability benchmarking.
     
@@ -117,8 +122,14 @@ def generate_scalability_configs(
                             # Training
                             num_rounds=num_rounds,
                             local_epochs=local_epochs,
-                            batch_size=64,
+                            batch_size=batch_size,
                             learning_rate=0.01,
+                            
+                            # Optimization
+                            num_workers=num_workers,
+                            pin_memory=pin_memory,
+                            prefetch_factor=prefetch_factor,
+                            use_amp=use_amp,
                             
                             # Ablation
                             ablation=ablation if ablation != "full" else "",
@@ -289,6 +300,15 @@ def main():
         help="Local training epochs per round (default: 1)",
     )
     
+    # Optimization parameters (optimized for Colab T4)
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (default: 128)")
+    parser.add_argument("--num-workers", type=int, default=2, help="Data loader workers (default: 2)")
+    parser.add_argument("--pin-memory", action="store_true", default=True, help="Pin memory (default: True)")
+    parser.add_argument("--no-pin-memory", action="store_false", dest="pin_memory", help="Disable pin memory")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Prefetch factor (default: 2)")
+    parser.add_argument("--use-amp", action="store_true", default=True, help="Use AMP (default: True)")
+    parser.add_argument("--no-amp", action="store_false", dest="use_amp", help="Disable AMP")
+    
     # Output
     parser.add_argument(
         "--output-dir",
@@ -319,6 +339,11 @@ def main():
         base_seed=args.base_seed,
         num_rounds=args.num_rounds,
         local_epochs=args.local_epochs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor,
+        use_amp=args.use_amp,
     )
     
     print("\n" + "=" * 80)

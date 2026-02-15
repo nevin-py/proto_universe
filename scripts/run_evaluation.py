@@ -299,6 +299,12 @@ class ExperimentConfig:
     attack_scale: float = 10.0
     backdoor_scale: float = 0.1
 
+    # Optimization parameters
+    num_workers: int = 2
+    pin_memory: bool = True
+    prefetch_factor: int = 2
+    use_amp: bool = True
+
     def __post_init__(self):
         if not self.experiment_id:
             self.experiment_id = (
@@ -707,8 +713,12 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     )
     client_loaders = create_client_loaders(
         train_dataset, partitions, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, prefetch_factor=cfg.prefetch_factor,
     )
-    test_loader = create_test_loader(test_dataset, batch_size=256)
+    test_loader = create_test_loader(
+        test_dataset, batch_size=256,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, prefetch_factor=cfg.prefetch_factor,
+    )
 
     # ── 2. Create model ───────────────────────────────────────────────
     logger.info("[Phase: MODEL] Creating and initializing model...")
@@ -853,7 +863,10 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
 
         for cid in range(cfg.num_clients):
             client_model = copy.deepcopy(global_model)
-            trainer = Trainer(model=client_model, learning_rate=cfg.learning_rate)
+            trainer = Trainer(
+                model=client_model, learning_rate=cfg.learning_rate,
+                use_amp=cfg.use_amp,
+            )
             loader = client_loaders[cid]
             trainer.train(loader, num_epochs=cfg.local_epochs)
             grads = trainer.get_gradients()
