@@ -1,0 +1,3 @@
+[submodule "sonobe"]
+	path = sonobe
+	url = git@github.com_Vanesor:Vanesor/sonobe.git
