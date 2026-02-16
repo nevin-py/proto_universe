@@ -304,6 +304,8 @@ class ExperimentConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     use_amp: bool = True
+    max_zkp_clients: int = 0  # Max clients for real ZKP (0 = all, >0 = sample)
+    zkp_workers: int = 1  # Parallel ZKP workers (1 = sequential, >1 = parallel)
     
     # Evaluation
     eval_every: int = 1  # Evaluate every N rounds
@@ -1257,11 +1259,24 @@ def _run_protogalaxy_round(
 
     # ZK proof generation
     if enable_zkp:
+        logger.info(
+            f"  ZKP proving started for {len(client_grads)} clients "
+            f"(max_zkp_clients={cfg.max_zkp_clients or 'ALL'})..."
+        )
         zk_start = time.perf_counter()
-        zk_metrics = pipeline.phase1_generate_zk_proofs(client_grads, round_num)
+        zk_metrics = pipeline.phase1_generate_zk_proofs(
+            client_grads, round_num,
+            max_zkp_clients=cfg.max_zkp_clients,
+            num_workers=cfg.zkp_workers,
+        )
         rmetrics.zk_prove_time = time.perf_counter() - zk_start
         rmetrics.zk_proofs_generated = zk_metrics.get("proofs_generated", 0)
         rmetrics.zk_mode = zk_metrics.get("mode", "NONE")
+        logger.info(
+            f"  ZKP proving done: {zk_metrics.get('proofs_real', 0)} real + "
+            f"{zk_metrics.get('proofs_fallback', 0)} fallback in "
+            f"{rmetrics.zk_prove_time:.1f}s"
+        )
     else:
         rmetrics.zk_mode = "DISABLED"
         
@@ -1316,11 +1331,24 @@ def _run_protogalaxy_round(
         all_verified_ids = [
             u["client_id"] for updates in galaxy_verified.values() for u in updates
         ]
+        # Only verify clients that had REAL ZKP proofs (skip fallback)
+        real_verified_ids = [
+            cid for cid in all_verified_ids
+            if cid in pipeline.client_zk_proofs and pipeline.client_zk_proofs[cid].is_real
+        ]
+        logger.info(
+            f"  ZKP verification started: {len(real_verified_ids)} real proofs "
+            f"(skipping {len(all_verified_ids) - len(real_verified_ids)} fallback)..."
+        )
         zk_verify_start = time.perf_counter()
-        zk_verify_metrics = pipeline.phase2_verify_zk_proofs(all_verified_ids)
+        zk_verify_metrics = pipeline.phase2_verify_zk_proofs(real_verified_ids)
         rmetrics.zk_verify_time = time.perf_counter() - zk_verify_start
         rmetrics.zk_proofs_verified = zk_verify_metrics.get("zk_verified", 0)
         rmetrics.zk_proofs_failed = zk_verify_metrics.get("zk_failed", 0)
+        logger.info(
+            f"  ZKP verification done: {rmetrics.zk_proofs_verified} OK, "
+            f"{rmetrics.zk_proofs_failed} failed in {rmetrics.zk_verify_time:.1f}s"
+        )
 
         # Remove ZK-rejected clients
         if zk_verify_metrics.get("zk_rejected_ids"):
@@ -1355,12 +1383,12 @@ def _run_protogalaxy_round(
         galaxy_defense_reports[galaxy_id] = report
 
         # Collect flagged client IDs
-        for idx in report.get("flagged_clients", []):
-            if idx < len(verified_updates):
-                round_flagged.add(verified_updates[idx]["client_id"])
-        for idx in report.get("statistical_flagged", []):
-            if idx < len(verified_updates):
-                round_flagged.add(verified_updates[idx]["client_id"])
+        # report.get("flagged_clients") and "statistical_flagged" contain Client IDs, not indices.
+        # We can add them directly to round_flagged.
+        for cid in report.get("flagged_clients", []):
+            round_flagged.add(cid)
+        for cid in report.get("statistical_flagged", []):
+            round_flagged.add(cid)
 
     # Galaxy submissions
     galaxy_submissions = {}
@@ -1396,7 +1424,7 @@ def _run_protogalaxy_round(
 
     pipeline.phase4_update_global_model(global_grads)
 
-    # ZK folding
+    # ZK folding (only for galaxies that have real ZKP proofs)
     if enable_zkp:
         clean_galaxy_ids = [
             u["galaxy_id"] for u in verified_galaxies
@@ -1405,9 +1433,16 @@ def _run_protogalaxy_round(
                 + global_defense_report.get("layer5_flagged_galaxies", [])
             )
         ]
+        logger.info(
+            f"  ZKP galaxy folding started: {len(clean_galaxy_ids)} galaxies..."
+        )
         zk_fold_start = time.perf_counter()
         zk_fold_metrics = pipeline.phase4_fold_galaxy_zk_proofs(clean_galaxy_ids)
         rmetrics.zk_fold_time = time.perf_counter() - zk_fold_start
+        logger.info(
+            f"  ZKP galaxy folding done: {zk_fold_metrics.get('galaxies_folded', 0)} "
+            f"galaxies in {rmetrics.zk_fold_time:.1f}s"
+        )
 
     pipeline.phase4_distribute_model()
 

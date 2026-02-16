@@ -53,6 +53,8 @@ def generate_scalability_configs(
     use_amp: bool,
     eval_every: int,
     model_type: str = None,
+    max_zkp_clients: int = 0,
+    zkp_workers: int = 4,
 ) -> List[ExperimentConfig]:
     """Generate experiment configurations for scalability benchmarking.
     
@@ -137,6 +139,10 @@ def generate_scalability_configs(
                             
                             # Evaluation
                             eval_every=eval_every,
+                            
+                            # ZKP optimization
+                            max_zkp_clients=max_zkp_clients,
+                            zkp_workers=zkp_workers,
                             
                             # Ablation
                             ablation=ablation if ablation != "full" else "",
@@ -283,6 +289,21 @@ def main():
     
     # Optimization arguments
     parser.add_argument(
+        "--max-zkp-clients",
+        type=int,
+        default=0,
+        help="Max clients for real ZKP proving per round (0=all, default: 0). "
+             "When > 0, only a random subset of clients get real ZK proofs; "
+             "the rest use fast SHA-256 fallback. Use with --zkp-workers for max speed.",
+    )
+    parser.add_argument(
+        "--zkp-workers",
+        type=int,
+        default=4,
+        help="Parallel workers for ZKP proving (default: 4). "
+             "Set to CPU core count for max speed. Sequential if 1.",
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=5,
@@ -368,6 +389,8 @@ def main():
         use_amp=args.use_amp,
         eval_every=args.eval_every,
         model_type=args.model,
+        max_zkp_clients=args.max_zkp_clients,
+        zkp_workers=args.zkp_workers,
     )
     
     print("\n" + "=" * 80)
@@ -379,6 +402,8 @@ def main():
     print(f"  Ablations:        {args.ablations}")
     print(f"  Trials/config:    {args.trials}")
     print(f"  Rounds:           {args.num_rounds}")
+    print(f"  Max ZKP clients:  {args.max_zkp_clients} (0=all)")
+    print(f"  ZKP workers:      {args.zkp_workers} (parallel processes)")
     print(f"  Total experiments: {len(configs)}")
     print(f"  Output:           {args.output_dir}")
     print("=" * 80)

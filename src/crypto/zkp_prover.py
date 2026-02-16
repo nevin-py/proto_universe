@@ -144,8 +144,6 @@ class GradientSumCheckProver:
             norm_bounds=norm_thresholds if norm_thresholds else [],
             bounds_enforced=bounds_enforced,
         )
-
-        return thresholds
     
     def _compute_norm_thresholds(self, gradients: List[torch.Tensor]) -> List[float]:
         """Compute per-layer norm thresholds from gradient sum statistics.

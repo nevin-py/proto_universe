@@ -312,13 +312,25 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
+    def _parallel_prove_worker(self, args):
+        """Worker function for parallel ZKP proving (must be picklable)."""
+        client_id, grads, round_number, use_bounds = args
+        # Move tensors to CPU for pickling
+        cpu_grads = [g.cpu() if isinstance(g, torch.Tensor) else g for g in grads]
+        # Import here to avoid pickle issues
+        from src.crypto.zkp_prover import GradientSumCheckProver
+        prover = GradientSumCheckProver(use_bounds=use_bounds)
+        return prover.prove_gradient_sum(cpu_grads, client_id, round_number)
+    
     def phase1_generate_zk_proofs(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
-        round_number: int
+        round_number: int,
+        max_zkp_clients: int = 0,
+        num_workers: int = 1,
     ) -> Dict[str, Any]:
         """
-        Phase 1: Generate ZK sum-check proofs for all clients.
+        Phase 1: Generate ZK sum-check proofs for clients.
         
         Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
           z_0 = 0  →  z_1 = z_0 + sum(layer_0)  →  ...  →  z_n = total_sum
@@ -326,36 +338,133 @@ class ProtoGalaxyPipeline:
         The proof is constant-size and verifiable in O(1).
         Architecture Section 3.3 — Commitment Generator + ZK verification.
         
+        When ``max_zkp_clients`` > 0 and there are more clients than that limit,
+        a deterministic random subset is selected for ZKP proving.  The remaining
+        clients receive fallback SHA-256 commitments.  This avoids the O(n) proving
+        bottleneck that makes large-scale benchmarks (100+ clients) stall.
+        
         Args:
             client_gradients: Dict mapping client_id → List[torch.Tensor]
             round_number: Current FL round
+            max_zkp_clients: Max clients to prove with real ZKP (0 = all)
             
         Returns:
             Dict with ZK metrics (proofs_generated, prove_time_ms, mode)
         """
+        import logging as _logging
+        _log = _logging.getLogger("protogalaxy.pipeline")
+        
         self.client_zk_proofs = {}  # Reset for this round
         zk_total_time_ms = 0.0
         
-        for client_id, grads in client_gradients.items():
-            zk_proof = self.zkp_prover.prove_gradient_sum(
-                gradients=grads,
-                client_id=client_id,
-                round_number=round_number,
+        # Determine which clients get real ZKP vs fallback
+        all_client_ids = list(client_gradients.keys())
+        total_clients = len(all_client_ids)
+        
+        if max_zkp_clients > 0 and total_clients > max_zkp_clients:
+            # Deterministic sampling based on round number for reproducibility
+            rng = np.random.RandomState(round_number * 1000 + 7)
+            zkp_client_ids = set(rng.choice(all_client_ids, size=max_zkp_clients, replace=False))
+            _log.info(
+                f"  ZKP sampling: proving {max_zkp_clients}/{total_clients} clients "
+                f"(sampled IDs: {sorted(zkp_client_ids)[:5]}{'...' if max_zkp_clients > 5 else ''})"
             )
-            self.client_zk_proofs[client_id] = zk_proof
-            zk_total_time_ms += zk_proof.prove_time_ms
+        else:
+            zkp_client_ids = set(all_client_ids)
+        
+        # Parallel proving when num_workers > 1
+        if num_workers > 1 and len(zkp_client_ids) > 1:
+            import multiprocessing as mp
+            _log.info(f"  ZKP parallel proving with {num_workers} workers...")
+            
+            # Prepare work items (only for clients in zkp_client_ids)
+            work_items = [
+                (cid, grads, round_number, self.zkp_prover._use_bounds)
+                for cid, grads in client_gradients.items()
+                if cid in zkp_client_ids
+            ]
+            
+            # Parallel prove
+            with mp.Pool(processes=num_workers) as pool:
+                results = pool.map(self._parallel_prove_worker, work_items)
+            
+            # Store results
+            for (cid, _, _, _), proof in zip(work_items, results):
+                self.client_zk_proofs[cid] = proof
+                zk_total_time_ms += proof.prove_time_ms
+            
+            # Fast fallback for non-sampled clients
+            for cid, grads in client_gradients.items():
+                if cid not in zkp_client_ids:
+                    self.client_zk_proofs[cid] = self._fast_fallback_proof(
+                        grads, cid, round_number
+                    )
+            
+            _log.info(
+                f"  ZKP parallel proving done: {len(work_items)} proofs in "
+                f"{zk_total_time_ms/1000:.1f}s (wall-clock speedup: "
+                f"{len(work_items) * results[0].prove_time_ms / 1000 / (zk_total_time_ms/1000):.1f}x)"
+            )
+        else:
+            # Sequential proving (original code)
+            for i, (client_id, grads) in enumerate(client_gradients.items()):
+                if client_id in zkp_client_ids:
+                    zk_proof = self.zkp_prover.prove_gradient_sum(
+                        gradients=grads,
+                        client_id=client_id,
+                        round_number=round_number,
+                    )
+                else:
+                    # Fallback: fast SHA-256 commitment for non-sampled clients
+                    zk_proof = self._fast_fallback_proof(grads, client_id, round_number)
+                
+                self.client_zk_proofs[client_id] = zk_proof
+                zk_total_time_ms += zk_proof.prove_time_ms
+                
+                # Progress logging every 10 clients or at the end
+                if (i + 1) % 10 == 0 or (i + 1) == total_clients:
+                    _log.info(
+                        f"  ZKP prove progress: {i+1}/{total_clients} clients "
+                        f"({zk_total_time_ms/1000:.1f}s elapsed)"
+                    )
         
         num_proofs = len(self.client_zk_proofs)
+        num_real = sum(1 for p in self.client_zk_proofs.values() if p.is_real)
         mode = "REAL (ProtoGalaxy IVC)" if (
-            num_proofs > 0 and next(iter(self.client_zk_proofs.values())).is_real
+            num_real > 0
         ) else "FALLBACK (SHA-256)"
         
         return {
             'proofs_generated': num_proofs,
+            'proofs_real': num_real,
+            'proofs_fallback': num_proofs - num_real,
             'prove_time_ms': zk_total_time_ms,
             'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
             'mode': mode,
         }
+    
+    def _fast_fallback_proof(self, grads, client_id, round_number):
+        """Generate a fast SHA-256 fallback proof (no Rust ZKP)."""
+        import hashlib
+        start = time.time()
+        layer_sums = [g.sum().item() for g in grads]
+        total_sum = sum(layer_sums)
+        data = f"sumcheck:{layer_sums}".encode()
+        commitment = hashlib.sha256(data).digest()
+        elapsed_ms = (time.time() - start) * 1000
+        from src.crypto.zkp_prover import ZKProof
+        return ZKProof(
+            proof_bytes=commitment,
+            claimed_sum=total_sum,
+            num_steps=len(layer_sums),
+            client_id=client_id,
+            round_number=round_number,
+            prove_time_ms=elapsed_ms,
+            is_real=False,
+            layer_sums=layer_sums,
+            norm_bounds=[],
+            bounds_enforced=False,
+        )
     
     # =========================================================================
     # Phase 2: Revelation Phase
@@ -916,6 +1025,9 @@ class ProtoGalaxyPipeline:
         Returns:
             Dict with folding metrics (galaxies_folded, folding_time_ms, mode)
         """
+        import logging as _logging
+        _log = _logging.getLogger("protogalaxy.pipeline")
+        
         self.galaxy_zk_proofs = {}
         
         if not self.client_zk_proofs:
@@ -925,17 +1037,28 @@ class ProtoGalaxyPipeline:
                 'mode': 'NONE',
             }
         
-        fold_start = time.time()
+        # Only fold proofs from clients that used REAL ZKP (skip fallback)
+        real_zk_proofs = {
+            cid: p for cid, p in self.client_zk_proofs.items() if p.is_real
+        }
         
-        for galaxy_id in clean_galaxy_ids:
+        fold_start = time.time()
+        total_galaxies = len(clean_galaxy_ids)
+        
+        for gi, galaxy_id in enumerate(clean_galaxy_ids):
             galaxy_client_ids = self.galaxy_assignments.get(galaxy_id, [])
             galaxy_proofs = [
-                self.client_zk_proofs[cid]
+                real_zk_proofs[cid]
                 for cid in galaxy_client_ids
-                if cid in self.client_zk_proofs
+                if cid in real_zk_proofs
             ]
             
             if galaxy_proofs:
+                _log.info(
+                    f"  ZKP fold galaxy {galaxy_id} ({gi+1}/{total_galaxies}): "
+                    f"{len(galaxy_proofs)} proofs, "
+                    f"{sum(len(p.layer_sums) for p in galaxy_proofs)} total steps"
+                )
                 folded = self.galaxy_proof_folder.fold_galaxy_proofs(
                     galaxy_proofs, galaxy_id
                 )
