@@ -968,7 +968,8 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         else:
             # Carry forward previous accuracy if not evaluating
             # (or 0.0 if not yet evaluated, though R0 is usually evaluated if eval_every=1)
-            # If we skip, we just leave it as 0.0 or the default
+            # If we skip, set to 0.0 (or last known if we tracked it) - here 0.0 suffices for logs
+            accuracy = 0.0
             pass
 
         # ── 5d. Detection metrics ─────────────────────────────────────
@@ -1920,6 +1921,7 @@ def main():
     parser.add_argument("--ablation", type=str, default="",
                         choices=["", "merkle_only", "zk_merkle"])
     parser.add_argument("--dirichlet-alpha", type=float, default=0.5)
+    parser.add_argument("--eval-every", type=int, default=1, help="Evaluate every N rounds")
 
     args = parser.parse_args()
 
