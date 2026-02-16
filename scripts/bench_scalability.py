@@ -93,7 +93,7 @@ def generate_scalability_configs(
             elif dataset == "mnist":
                 selected_model = "mnist_cnn"
             elif dataset == "cifar10":
-                selected_model = "cifar10_cnn"
+                selected_model = "cifar10_small"
             else:
                 selected_model = "mlp"
             

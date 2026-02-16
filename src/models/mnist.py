@@ -124,7 +124,7 @@ def create_mnist_model(model_type: str = 'linear', num_classes: int = 10) -> nn.
         return MNISTLinearRegression(num_classes=num_classes)
     elif model_type == 'mlp':
         return SimpleMLP(num_classes=num_classes)
-    elif model_type == 'cnn':
+    elif model_type == 'cnn' or model_type == 'mnist_cnn':
         return MNISTCnn(num_classes=num_classes)
     else:
         raise ValueError(f"Unknown model type: {model_type}. Choose 'linear', 'mlp', or 'cnn'.")

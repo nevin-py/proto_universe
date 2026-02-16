@@ -1913,7 +1913,7 @@ def main():
     parser.add_argument("--trim-ratio", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "cifar10"])
     parser.add_argument("--model-type", type=str, default="linear",
-                        choices=["linear", "mlp", "cnn", "cifar10_cnn", "resnet18"])
+                        choices=["linear", "mlp", "cnn", "mnist_cnn", "cifar10_cnn", "cifar10_small", "resnet18"])
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.01)
