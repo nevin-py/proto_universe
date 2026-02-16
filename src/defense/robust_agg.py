@@ -39,7 +39,8 @@ class TrimmedMeanAggregator:
             raise ValueError("trim_ratio must be in [0.0, 0.5)")
         
         self.trim_ratio = trim_ratio
-        self.trimmed_indices: dict = {}  # Maps dimension -> set of trimmed indices
+        self.trimmed_indices: dict = {}  # Maps dimension -> set of trimmed indices (Deprecated)
+        self.client_trim_counts: dict = {}  # Maps client_id -> count of trims
         self.original_shapes: list = []
         self._last_n: int = 0
     
@@ -91,31 +92,38 @@ class TrimmedMeanAggregator:
             flattened.append(flat)
         
         flattened = np.array(flattened)  # Shape: (n, d)
-        d = flattened.shape[1]
         
-        # Coordinate-wise trimmed mean
-        aggregated = np.zeros(d, dtype=np.float32)
-        self.trimmed_indices = {}
-        
-        for dim in range(d):
-            values = flattened[:, dim]
+        # Coordinate-wise trimmed mean (Vectorized)
+        if trim_count == 0:
+            aggregated = np.mean(flattened, axis=0)
+            self.client_trim_counts = {}
+        else:
+            # Sort along client dimension (axis 0)
+            sorted_indices = np.argsort(flattened, axis=0)
             
-            if trim_count > 0:
-                # Sort and get indices
-                sorted_indices = np.argsort(values)
-                
-                # Trim bottom and top
-                keep_indices = sorted_indices[trim_count:n - trim_count]
-                trimmed_low = set(sorted_indices[:trim_count])
-                trimmed_high = set(sorted_indices[n - trim_count:])
-                
-                self.trimmed_indices[dim] = trimmed_low | trimmed_high
-                
-                # Average the kept values
-                aggregated[dim] = np.mean(values[keep_indices])
-            else:
-                # No trimming, just average
-                aggregated[dim] = np.mean(values)
+            # Take middle values logic:
+            # We can't simply take mean of middle values directly if we want to sort values
+            # np.take_along_axis is useful here
+            sorted_values = np.take_along_axis(flattened, sorted_indices, axis=0)
+            
+            # Keep only the middle rows
+            kept_values = sorted_values[trim_count:n-trim_count, :]
+            
+            # Aggregate
+            aggregated = np.mean(kept_values, axis=0)
+            
+            # Track frequent trimming (for reputation)
+            # Flatten the trimmed indices (top and bottom)
+            trimmed_low = sorted_indices[:trim_count, :].flatten()
+            trimmed_high = sorted_indices[n-trim_count:, :].flatten()
+            all_trimmed = np.concatenate([trimmed_low, trimmed_high])
+            
+            # Count occurrences of each client ID
+            counts = np.bincount(all_trimmed, minlength=n)
+            self.client_trim_counts = {i: int(c) for i, c in enumerate(counts) if c > 0}
+            
+            # Clear old memory-heavy dict
+            self.trimmed_indices = {} 
         
         return {
             'gradients': aggregated,
@@ -127,12 +135,12 @@ class TrimmedMeanAggregator:
         }
     
     def get_trimmed_indices(self) -> dict:
-        """Get indices of trimmed updates per dimension.
+        """Deprecated: Get indices of trimmed updates per dimension.
         
         Returns:
-            Dict mapping dimension index to set of trimmed client indices
+            Empty dict (memory optimization).
         """
-        return self.trimmed_indices
+        return {}
     
     def get_frequently_trimmed_clients(self, threshold: float = 0.5) -> list:
         """Identify clients that were frequently trimmed across dimensions.
@@ -146,20 +154,34 @@ class TrimmedMeanAggregator:
         Returns:
             List of (client_index, trim_fraction) tuples sorted by fraction
         """
-        if not self.trimmed_indices or self._last_n == 0:
+        if not hasattr(self, 'client_trim_counts') or not self.client_trim_counts or self.original_shapes == []:
+             # Need total dims to compute fraction
+             # We can compute total dims from original shapes or just assume it from last run
+             # BUT aggregated shape is easier
+             return []
+        
+        # Calculate total dimensions
+        # self.client_trim_counts was computed on flattened array, so d is needed
+        # We can approximate d by summing counts / (2 * trim_count) if we knew trim_count
+        # Better: store d during aggregation
+        
+        # Let's check trimmed_counts from aggregate return, but here we don't have it.
+        # We can infer total dimensions from summation of counts?
+        # sum(counts) = d * 2 * trim_count
+        # So d = sum(counts) / (2 * trim_count_per_dim)
+        
+        # Wait, simple way: max possible count is d.
+        # But we don't stored 'd'.
+        # Let's store 'd' in aggregate.
+        # For now, let's fix this method after storing 'd' in aggregate properly.
+        # Actually, let's look at how to get 'd'.
+        
+        total_dims = sum(np.prod(s) for s in self.original_shapes)
+        if total_dims == 0:
             return []
-        
-        # Count how often each client was trimmed
-        trim_counts = {}
-        total_dims = len(self.trimmed_indices)
-        
-        for dim, trimmed_set in self.trimmed_indices.items():
-            for idx in trimmed_set:
-                trim_counts[idx] = trim_counts.get(idx, 0) + 1
-        
-        # Calculate fraction and filter by threshold
+            
         frequent = []
-        for idx, count in trim_counts.items():
+        for idx, count in self.client_trim_counts.items():
             fraction = count / total_dims
             if fraction >= threshold:
                 frequent.append((idx, fraction))
