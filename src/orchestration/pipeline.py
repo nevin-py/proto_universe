@@ -39,17 +39,28 @@ from src.logging import FLLogger
 
 
 def _zkp_prove_worker(args):
-    """Module-level worker function for parallel ZKP proving (spawn-compatible).
+    """Module-level worker function for parallel ZKP proving (file-based IPC).
     
-    Must be at module level for multiprocessing.spawn to pickle correctly.
+    Uses file-based communication to avoid BrokenPipeError with large proof objects.
+    Worker saves proof to a pickle file, main process reads it back.
     """
-    client_id, grads, round_number, use_bounds = args
+    import pickle
+    import os
+    
+    client_id, grads, round_number, use_bounds, temp_dir = args
     # Move tensors to CPU for pickling
     cpu_grads = [g.cpu() if isinstance(g, torch.Tensor) else g for g in grads]
     # Import here to avoid import-time issues
     from src.crypto.zkp_prover import GradientSumCheckProver
     prover = GradientSumCheckProver(use_bounds=use_bounds)
-    return prover.prove_gradient_sum(cpu_grads, client_id, round_number)
+    proof = prover.prove_gradient_sum(cpu_grads, client_id, round_number)
+    
+    # Save proof to file instead of returning (avoids pipe serialization)
+    result_file = os.path.join(temp_dir, f"proof_{client_id}.pkl")
+    with open(result_file, 'wb') as f:
+        pickle.dump(proof, f)
+    
+    return client_id  # Only return lightweight client_id
 
 
 @dataclass
@@ -379,24 +390,33 @@ class ProtoGalaxyPipeline:
         # Parallel proving when num_workers > 1
         if num_workers > 1 and len(zkp_client_ids) > 1:
             import multiprocessing as mp
-            _log.info(f"  ZKP parallel proving with {num_workers} workers...")
+            import tempfile
+            import pickle
+            import os
             
-            # Prepare work items (only for clients in zkp_client_ids)
-            work_items = [
-                (cid, grads, round_number, self.zkp_prover._use_bounds)
-                for cid, grads in client_gradients.items()
-                if cid in zkp_client_ids
-            ]
+            _log.info(f"  ZKP parallel proving with {num_workers} workers (file-based IPC)...")
             
-            # Parallel prove with 'spawn' method (CUDA-compatible)
-            ctx = mp.get_context('spawn')
-            with ctx.Pool(processes=num_workers) as pool:
-                results = pool.map(_zkp_prove_worker, work_items)
-            
-            # Store results
-            for (cid, _, _, _), proof in zip(work_items, results):
-                self.client_zk_proofs[cid] = proof
-                zk_total_time_ms += proof.prove_time_ms
+            # Create temp directory for file-based IPC
+            with tempfile.TemporaryDirectory(prefix='zkp_proofs_') as temp_dir:
+                # Prepare work items (include temp_dir for file output)
+                work_items = [
+                    (cid, grads, round_number, self.zkp_prover._use_bounds, temp_dir)
+                    for cid, grads in client_gradients.items()
+                    if cid in zkp_client_ids
+                ]
+                
+                # Parallel prove with 'spawn' method (CUDA-compatible)
+                ctx = mp.get_context('spawn')
+                with ctx.Pool(processes=num_workers) as pool:
+                    client_ids = pool.map(_zkp_prove_worker, work_items)
+                
+                # Read results from files
+                for cid in client_ids:
+                    result_file = os.path.join(temp_dir, f"proof_{cid}.pkl")
+                    with open(result_file, 'rb') as f:
+                        proof = pickle.load(f)
+                    self.client_zk_proofs[cid] = proof
+                    zk_total_time_ms += proof.prove_time_ms
             
             # Fast fallback for non-sampled clients
             for cid, grads in client_gradients.items():
@@ -405,11 +425,12 @@ class ProtoGalaxyPipeline:
                         grads, cid, round_number
                     )
             
-            _log.info(
-                f"  ZKP parallel proving done: {len(work_items)} proofs in "
-                f"{zk_total_time_ms/1000:.1f}s (wall-clock speedup: "
-                f"{len(work_items) * results[0].prove_time_ms / 1000 / (zk_total_time_ms/1000):.1f}x)"
-            )
+            if client_ids:
+                avg_time = zk_total_time_ms / len(client_ids)
+                _log.info(
+                    f"  ZKP parallel proving done: {len(client_ids)} proofs, "
+                    f"avg {avg_time:.0f}ms/proof, total {zk_total_time_ms/1000:.1f}s"
+                )
         else:
             # Sequential proving (original code)
             for i, (client_id, grads) in enumerate(client_gradients.items()):
