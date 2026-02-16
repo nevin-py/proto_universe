@@ -2,7 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+results/
+eval_small_scale/
+eval_fix_test/
+eval_fix_test2/
+nohup.out
+Makefile
 # Distribution / packaging
 .Python
 build/
@@ -59,3 +64,20 @@ Cargo.lock
 *.pyd
 *.dll
 *.dylib
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+eval_results/logs/
+
+# Temporary files
+*.tmp
+*.bak
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/

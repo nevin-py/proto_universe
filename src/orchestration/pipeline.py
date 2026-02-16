@@ -167,6 +167,7 @@ class ProtoGalaxyPipeline:
         self.galaxy_proof_folder = GalaxyProofFolder()
         self.client_zk_proofs: Dict[int, ZKProof] = {}   # client_id -> ZKProof
         self.galaxy_zk_proofs: Dict[int, ZKProof] = {}    # galaxy_id -> folded ZKProof
+        self.global_norm_bounds: Optional[List[float]] = None  # Server-side norm bounds
         
         # Storage for current round
         self.round_commitments: Dict[int, Dict[int, str]] = {}  # galaxy_id -> {client_id -> hash}
@@ -312,6 +313,39 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
+    def _compute_global_norm_bounds(
+        self,
+        client_gradients: Dict[int, List[torch.Tensor]],
+    ) -> List[float]:
+        """Compute server-side norm bounds from all clients using robust statistics.
+
+        For each layer, the bound is: median(L2_norm) + k * MAD(L2_norm)
+        where k = norm_scale_factor (default 3.0).
+
+        Uses L2 norms — NOT scalar sums — because gradient values tend to
+        cancel out in large tensors, making sums ≈ 0 for both honest and
+        malicious clients.  L2 norms scale proportionally with attack
+        magnitude (e.g. 10× scaling → 10× norm).
+
+        This prevents malicious clients from setting their own bounds.
+        """
+        num_layers = len(next(iter(client_gradients.values())))
+        k = self.zkp_prover._norm_scale_factor
+
+        per_layer_norms: List[List[float]] = [[] for _ in range(num_layers)]
+        for grads in client_gradients.values():
+            for li, g in enumerate(grads):
+                per_layer_norms[li].append(torch.norm(g).item())  # L2 norm, NOT sum
+
+        bounds = []
+        for layer_vals in per_layer_norms:
+            t = torch.tensor(layer_vals)
+            median = t.median().item()
+            mad = (t - median).abs().median().item()
+            bound = median + k * max(mad, 1e-6)
+            bounds.append(max(bound, 1e-6))
+        return bounds
+
     def phase1_generate_zk_proofs(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
@@ -322,6 +356,10 @@ class ProtoGalaxyPipeline:
         
         Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
           z_0 = 0  →  z_1 = z_0 + sum(layer_0)  →  ...  →  z_n = total_sum
+        
+        Global norm bounds are computed server-side from robust statistics
+        (median + k*MAD) across ALL clients' gradient norms.  Malicious clients
+        with out-of-bound gradients will fail proof generation.
         
         The proof is constant-size and verifiable in O(1).
         Architecture Section 3.3 — Commitment Generator + ZK verification.
@@ -335,15 +373,57 @@ class ProtoGalaxyPipeline:
         """
         self.client_zk_proofs = {}  # Reset for this round
         zk_total_time_ms = 0.0
+        zk_bound_failures = 0
+
+        # Compute SERVER-SIDE global norm bounds from all clients (using L2 norms)
+        if self.zkp_prover._use_bounds:
+            self.global_norm_bounds = self._compute_global_norm_bounds(client_gradients)
+            if self.logger:
+                self.logger.logger.debug(
+                    f"Global norm bounds (median+{self.zkp_prover._norm_scale_factor}*MAD): "
+                    f"{[f'{b:.4f}' for b in self.global_norm_bounds]}"
+                )
+        else:
+            self.global_norm_bounds = None
         
         for client_id, grads in client_gradients.items():
-            zk_proof = self.zkp_prover.prove_gradient_sum(
-                gradients=grads,
-                client_id=client_id,
-                round_number=round_number,
-            )
-            self.client_zk_proofs[client_id] = zk_proof
-            zk_total_time_ms += zk_proof.prove_time_ms
+            # ----- Server-side L2 norm check (before ZKP proving) -----
+            # This catches malicious clients whose gradient norms exceed
+            # the robust bounds.  The ZKP circuit checks scalar sums
+            # (which cancel out), so we need this explicit norm check.
+            if self.global_norm_bounds:
+                violation_layers = []
+                for li, g in enumerate(grads):
+                    client_norm = torch.norm(g).item()
+                    if client_norm > self.global_norm_bounds[li]:
+                        violation_layers.append(
+                            f"L{li}({client_norm:.2f}>{self.global_norm_bounds[li]:.2f})"
+                        )
+                
+                if violation_layers:
+                    zk_bound_failures += 1
+                    if self.logger:
+                        self.logger.logger.info(
+                            f"  Client {client_id}: ✗ REJECTED — norm violations [{', '.join(violation_layers)}]"
+                        )
+                    continue  # Skip proof generation — client rejected
+
+            try:
+                zk_proof = self.zkp_prover.prove_gradient_sum(
+                    gradients=grads,
+                    client_id=client_id,
+                    round_number=round_number,
+                    norm_thresholds=None,  # Norms already checked above
+                )
+                self.client_zk_proofs[client_id] = zk_proof
+                zk_total_time_ms += zk_proof.prove_time_ms
+            except Exception as e:
+                # Malicious client's gradients exceed bounds
+                zk_bound_failures += 1
+                if self.logger:
+                    self.logger.logger.warning(
+                        f"ZKP proof generation FAILED for client {client_id}: {e}"
+                    )
         
         num_proofs = len(self.client_zk_proofs)
         mode = "REAL (ProtoGalaxy IVC)" if (
@@ -355,6 +435,7 @@ class ProtoGalaxyPipeline:
             'prove_time_ms': zk_total_time_ms,
             'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
             'mode': mode,
+            'bound_failures': zk_bound_failures,
         }
     
     # =========================================================================
@@ -532,9 +613,17 @@ class ProtoGalaxyPipeline:
         for client_id in verified_client_ids:
             zk_proof = self.client_zk_proofs.get(client_id)
             if zk_proof is None:
-                continue  # No ZK proof for this client (shouldn't happen)
+                # Client had no proof (likely failed during generation due to
+                # bound violation) — treat as rejected
+                zk_failed += 1
+                zk_rejected_ids.append(client_id)
+                continue
             
-            is_valid = GradientSumCheckProver.verify_proof(zk_proof)
+            # Verify using SERVER-SIDE norm bounds (not client-reported)
+            is_valid = GradientSumCheckProver.verify_proof(
+                zk_proof,
+                server_norm_bounds=self.global_norm_bounds,
+            )
             if is_valid:
                 zk_verified += 1
             else:
@@ -612,44 +701,19 @@ class ProtoGalaxyPipeline:
             aggregated_gradients = agg_raw
         
         # ================================================================
-        # Trust-Weighted Aggregation (Architecture Section 4.4)
-        # w̄ = Σ(Rᵢ · ∇wᵢ) / Σ(Rᵢ)
-        # Applied AFTER defense filtering so that the statistical analyzer
-        # and robust aggregator operate on unweighted gradients.
+        # Trust-Weighted Aggregation — DISABLED (Bug #1 fix)
+        #
+        # Previously this block recomputed a reputation-weighted average
+        # from cleaned updates, which OVERWROTE the Layer 3 robust
+        # aggregation output (TrimmedMean / MultiKrum).  Because all
+        # reputation scores start at 0.5 and never diverge (Bug #2),
+        # the reweighting was equivalent to simple averaging — making
+        # ProtoGalaxy and MultiKrum produce identical results.
+        #
+        # The robust aggregation from Layer 3 is now preserved as-is.
+        # Reputation scores are logged for analysis but do not modify
+        # the aggregated gradients.
         # ================================================================
-        reputation_sum = sum(
-            u.get('reputation', 0.5) for u in verified_updates
-        )
-        if reputation_sum > 0 and aggregated_gradients is not None:
-            # The aggregator already averaged the gradients.  To retroactively
-            # apply trust-weighted averaging we compute a per-client weighted
-            # mean ourselves from the cleaned updates that the aggregator used.
-            cleaned = defense_result.get('cleaned_updates', verified_updates)
-            if len(cleaned) > 1:
-                rep_weights = []
-                for u in cleaned:
-                    # Retrieve the reputation stored during Phase 2
-                    rep_weights.append(u.get('reputation', 0.5))
-                total_rep = sum(rep_weights)
-                if total_rep > 0:
-                    # Recompute weighted average from cleaned updates
-                    first_grads = cleaned[0]['gradients']
-                    weighted_agg = [
-                        torch.zeros_like(g) if isinstance(g, torch.Tensor)
-                        else np.zeros_like(np.asarray(g))
-                        for g in first_grads
-                    ]
-                    for u, w in zip(cleaned, rep_weights):
-                        for li, g in enumerate(u['gradients']):
-                            if isinstance(g, torch.Tensor):
-                                weighted_agg[li] = weighted_agg[li] + g * (w / total_rep)
-                            else:
-                                weighted_agg[li] = weighted_agg[li] + np.asarray(g) * (w / total_rep)
-                    # Convert everything to tensors
-                    aggregated_gradients = [
-                        torch.tensor(g, dtype=torch.float32) if not isinstance(g, torch.Tensor) else g
-                        for g in weighted_agg
-                    ]
         
         # Get flagged clients
         flagged_clients = list(set(

@@ -724,14 +724,18 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
 
     # ── 3. Byzantine setup ─────────────────────────────────────────────
     num_byzantine = int(cfg.num_clients * cfg.byzantine_fraction)
-    byzantine_ids: Set[int] = set(range(num_byzantine))
+    # RANDOMIZE malicious client selection for better diversity (not just first N)
     if num_byzantine > 0:
+        import random
+        rng = random.Random(cfg.seed)  # Reproducible randomization
+        byzantine_ids: Set[int] = set(rng.sample(range(cfg.num_clients), num_byzantine))
         logger.info(
             f"[Phase: BYZANTINE] {num_byzantine}/{cfg.num_clients} Byzantine clients "
             f"({cfg.byzantine_fraction:.0%}) — IDs: {sorted(byzantine_ids)}"
         )
         logger.info(f"  Attack type: {cfg.attack}, scale={cfg.attack_scale}")
     else:
+        byzantine_ids: Set[int] = set()
         logger.info("[Phase: BYZANTINE] No Byzantine clients (clean run)")
 
     # ── 4. Build pipeline or vanilla path ──────────────────────────────
@@ -1205,6 +1209,12 @@ def _run_protogalaxy_round(
         rmetrics.zk_prove_time = time.perf_counter() - zk_start
         rmetrics.zk_proofs_generated = zk_metrics.get("proofs_generated", 0)
         rmetrics.zk_mode = zk_metrics.get("mode", "NONE")
+        bound_failures = zk_metrics.get("bound_failures", 0)
+        if bound_failures > 0:
+            logger.info(
+                f"  ZKP BOUND VIOLATIONS: {bound_failures} client(s) failed "
+                f"proof generation (malicious gradients exceeded server bounds)"
+            )
     else:
         rmetrics.zk_mode = "DISABLED"
 
@@ -1221,11 +1231,13 @@ def _run_protogalaxy_round(
     rmetrics.merkle_verify_time = time.perf_counter() - merkle_verify_start
 
     rmetrics.phase1_time = time.perf_counter() - phase1_start
+    zk_bf = zk_metrics.get("bound_failures", 0) if enable_zkp else 0
     logger.debug(
         f"  Phase 1 COMMIT: {rmetrics.phase1_time:.3f}s — "
         f"merkle_build={rmetrics.merkle_build_time:.4f}s, "
         f"merkle_verify={rmetrics.merkle_verify_time:.4f}s, "
-        f"zk_prove={rmetrics.zk_prove_time:.3f}s ({rmetrics.zk_proofs_generated} proofs)"
+        f"zk_prove={rmetrics.zk_prove_time:.3f}s ({rmetrics.zk_proofs_generated} proofs"
+        f"{f', {zk_bf} bound violations' if zk_bf else ''})"
     )
 
     # ==========================
@@ -1263,11 +1275,20 @@ def _run_protogalaxy_round(
         # Remove ZK-rejected clients
         if zk_verify_metrics.get("zk_rejected_ids"):
             zk_reject_set = set(zk_verify_metrics["zk_rejected_ids"])
+            logger.info(
+                f"  ZKP REJECTED {len(zk_reject_set)} client(s): {sorted(zk_reject_set)}"
+            )
             for gid in galaxy_verified:
+                before = len(galaxy_verified[gid])
                 galaxy_verified[gid] = [
                     u for u in galaxy_verified[gid]
                     if u["client_id"] not in zk_reject_set
                 ]
+                after = len(galaxy_verified[gid])
+                if before != after:
+                    logger.debug(
+                        f"    Galaxy {gid}: removed {before - after} ZK-rejected client(s)"
+                    )
 
     rmetrics.phase2_time = time.perf_counter() - phase2_start
     logger.debug(

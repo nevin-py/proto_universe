@@ -203,21 +203,28 @@ class MultiKrumAggregator:
         n = len(updates)
         
         if n <= 2 * self.f + 2:
-            # Not enough clients for Krum, fall back to simple average
-            flattened = []
-            for update in updates:
-                flat = np.concatenate([
-                    g.detach().cpu().numpy().flatten() if isinstance(g, torch.Tensor)
-                    else np.array(g).flatten()
-                    for g in update['gradients']
-                ])
-                flattened.append(flat)
-            
-            self.selected_indices = list(range(n))
-            return {
-                'gradients': np.mean(flattened, axis=0),
-                'selected_indices': self.selected_indices
-            }
+            # Not enough clients for Krum — cap f to allow Krum to work.
+            # Krum needs n > 2f + 2, so f_eff = max(0, (n - 3) // 2)
+            f_eff = max(0, (n - 3) // 2)
+            if f_eff == 0:
+                # Truly too few clients — fall back to simple average
+                flattened = []
+                for update in updates:
+                    flat = np.concatenate([
+                        g.detach().cpu().numpy().flatten() if isinstance(g, torch.Tensor)
+                        else np.array(g).flatten()
+                        for g in update['gradients']
+                    ])
+                    flattened.append(flat)
+                
+                self.selected_indices = list(range(n))
+                return {
+                    'gradients': np.mean(flattened, axis=0),
+                    'selected_indices': self.selected_indices
+                }
+            else:
+                # Use capped f so Krum can still operate
+                self.f = f_eff
         
         # Flatten gradients
         flattened = []

@@ -224,11 +224,17 @@ class GradientSumCheckProver:
         return commitment, len(layer_sums)
 
     @staticmethod
-    def verify_proof(proof: ZKProof) -> bool:
+    def verify_proof(
+        proof: ZKProof,
+        server_norm_bounds: Optional[List[float]] = None,
+    ) -> bool:
         """Verify a ZK sum-check proof.
 
         Args:
             proof: The ZKProof to verify
+            server_norm_bounds: Server-computed norm bounds.  When provided,
+                these OVERRIDE the proof's self-reported ``norm_bounds``
+                so that a malicious client cannot set its own thresholds.
 
         Returns:
             True if proof is valid
@@ -236,7 +242,7 @@ class GradientSumCheckProver:
         start = time.time()
 
         if proof.is_real and _ZKP_AVAILABLE:
-            valid = GradientSumCheckProver._verify_real(proof)
+            valid = GradientSumCheckProver._verify_real(proof, server_norm_bounds)
         else:
             valid = GradientSumCheckProver._verify_fallback(proof)
 
@@ -248,16 +254,35 @@ class GradientSumCheckProver:
         return valid
 
     @staticmethod
-    def _verify_real(proof: ZKProof) -> bool:
-        """Verify using Rust ProtoGalaxy IVC verification."""
+    def _verify_real(
+        proof: ZKProof,
+        server_norm_bounds: Optional[List[float]] = None,
+    ) -> bool:
+        """Verify using Rust ProtoGalaxy IVC verification.
+        
+        When *server_norm_bounds* is provided the verifier uses those bounds
+        instead of the proof's self-reported ``norm_bounds``.  This prevents
+        a malicious client from choosing its own (inflated) thresholds.
+        """
         try:
-            # Use bounded prover if bounds were enforced
-            if proof.bounds_enforced and proof.norm_bounds:
+            # Decide which bounds to enforce
+            use_bounds = False
+            bounds_to_use: List[float] = []
+
+            if server_norm_bounds and len(server_norm_bounds) == len(proof.layer_sums):
+                # Server-side bounds always take precedence
+                use_bounds = True
+                bounds_to_use = server_norm_bounds
+            elif proof.bounds_enforced and proof.norm_bounds:
+                use_bounds = True
+                bounds_to_use = proof.norm_bounds
+
+            if use_bounds:
                 prover = _FLZKPBoundedProver()
                 prover.initialize(0.0)
 
-                # Re-fold the layer sums with bounds
-                for layer_sum, max_norm in zip(proof.layer_sums, proof.norm_bounds):
+                # Re-fold the layer sums with SERVER bounds
+                for layer_sum, max_norm in zip(proof.layer_sums, bounds_to_use):
                     prover.prove_gradient_step(layer_sum, max_norm)
             else:
                 # Legacy unbounded prover
@@ -271,7 +296,7 @@ class GradientSumCheckProver:
             # Verify the IVC proof
             return prover.verify_proof(list(proof.proof_bytes))
         except Exception as e:
-            logger.error(f"ZK verification failed: {e}")
+            logger.error(f"ZK verification failed for client {proof.client_id}: {e}")
             return False
 
     @staticmethod
