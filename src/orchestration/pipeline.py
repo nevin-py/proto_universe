@@ -384,8 +384,9 @@ class ProtoGalaxyPipeline:
                 if cid in zkp_client_ids
             ]
             
-            # Parallel prove
-            with mp.Pool(processes=num_workers) as pool:
+            # Parallel prove with 'spawn' method (CUDA-compatible)
+            ctx = mp.get_context('spawn')
+            with ctx.Pool(processes=num_workers) as pool:
                 results = pool.map(self._parallel_prove_worker, work_items)
             
             # Store results
