@@ -135,6 +135,45 @@ class CIFAR10CNN(nn.Module):
 _MODEL_REGISTRY['cifar10_cnn'] = CIFAR10CNN
 _MODEL_REGISTRY['cifar10'] = CIFAR10CNN
 
+
+# Small CIFAR-10 CNN for faster ZKP
+class CIFAR10Small(nn.Module):
+    """Small CNN for CIFAR-10 with fewer parameters (for ZKP optimization)"""
+    
+    def __init__(self, num_classes: int = 10):
+        super(CIFAR10Small, self).__init__()
+        
+        # ~210k parameters (vs 2.1M for standard CNN)
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2), # 16x16
+            
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2), # 8x8
+        )
+        
+        self.fc_layers = nn.Sequential(
+            nn.Linear(32 * 8 * 8, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layers(x)
+        return x
+
+_MODEL_REGISTRY['cifar10_small'] = CIFAR10Small
+
+
+
+
+
 # ResNet18 for CIFAR-10 (imported lazily to avoid circular deps)
 try:
     from src.models.resnet import CIFAR10ResNet18

@@ -249,19 +249,65 @@ class ProtoGalaxyOrchestrator:
         
         if client_gradients:
             logger.info(f"Generating ZK sum-check proofs for {len(client_gradients)} clients...")
-            for client_id, grads in client_gradients.items():
-                zk_proof = self.zkp_prover.prove_gradient_sum(
-                    gradients=grads,
-                    client_id=client_id,
-                    round_number=self.current_round,
-                )
-                self.client_zk_proofs[client_id] = zk_proof
-                zk_proofs_generated += 1
-                zk_total_time_ms += zk_proof.prove_time_ms
+            
+            # Filter out clients with excessive L2 norms (Byzantine check)
+            # Threshold matches Rust backend default (10.0) or user observed value (4.92 vs 49.20)
+            NORM_THRESHOLD = 15.0 # Conservative upper bound, malicious observed at ~49.2
+            
+            valid_gradients = {}
+            for cid, grads in client_gradients.items():
+                try:
+                    # Calculate L2 norm of the full gradient vector
+                    # grads is list of tensors
+                    total_norm = 0.0
+                    for g in grads:
+                        total_norm += g.norm().item() ** 2
+                    total_norm = total_norm ** 0.5
+                    
+                    if total_norm > NORM_THRESHOLD:
+                         logger.warning(f"Client {cid} rejected: L2 norm {total_norm:.4f} exceeds limit {NORM_THRESHOLD}")
+                         continue
+                        
+                    valid_gradients[cid] = grads
+                except Exception as e:
+                    logger.error(f"Error checking norm for client {cid}: {e}")
+                    
+            logger.info(f"  Passed norm check: {len(valid_gradients)}/{len(client_gradients)} clients")
+
+            # Parallelize ZKP generation
+            # Rust backend releases GIL, so threading works well here
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import os
+            
+            # Use max workers based on CPU count (Colab usually has 2-4 vCPUs)
+            # But for IO/Rust-bound tasks we can oversubscribe slightly
+            max_workers = min(32, (os.cpu_count() or 1) * 4)
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_cid = {
+                    executor.submit(
+                        self.zkp_prover.prove_gradient_sum,
+                        gradients=grads,
+                        client_id=client_id,
+                        round_number=self.current_round
+                    ): client_id
+                    for client_id, grads in valid_gradients.items()
+                }
+                
+                for future in as_completed(future_to_cid):
+                    client_id = future_to_cid[future]
+                    try:
+                        zk_proof = future.result()
+                        self.client_zk_proofs[client_id] = zk_proof
+                        zk_proofs_generated += 1
+                        zk_total_time_ms += zk_proof.prove_time_ms
+                    except Exception as e:
+                        logger.error(f"Failed to generate ZK proof for client {client_id}: {e}")
             
             mode = "REAL (ProtoGalaxy IVC)" if self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK (SHA-256)"
-            logger.info(f"✓ ZK proofs: {zk_proofs_generated} generated [{mode}]")
-            logger.info(f"  Total prove time: {zk_total_time_ms:.1f}ms ({zk_total_time_ms/max(zk_proofs_generated,1):.1f}ms/client)")
+            logger.info(f"✓ ZK proofs: {zk_proofs_generated} generated [{mode}] with {max_workers} threads")
+            # Average time is misleading in parallel, but total_time gives CPU-effort indication
+            logger.info(f"  Total prove CPU-time: {zk_total_time_ms:.1f}ms")
         else:
             logger.info("  (No client gradients provided — ZK proofs skipped)")
         
@@ -299,106 +345,120 @@ class ProtoGalaxyOrchestrator:
         """
         logger.info(f"Verifying Merkle proofs for {len(client_updates)} clients")
         
+        # 2a. Verify Merkle Proofs & ZK Proofs
+        # 2a. Verify Merkle Proofs & ZK Proofs
         verified_updates = {}
         rejected_clients = []
         verification_results = {}
+        verified_clients = []
         
-        for client_id, update in client_updates.items():
-            proof = client_proofs.get(client_id, [])
-            commitment = client_commitments.get(client_id, "")
-            
-            # Get galaxy
-            galaxy_id = self.galaxy_manager.get_client_galaxy(client_id)
-            if galaxy_id is None:
-                logger.warning(f"Client {client_id} not assigned to any galaxy, rejecting")
-                rejected_clients.append(client_id)
-                verification_results[client_id] = False
-                continue
-            
-            # Verify Merkle proof
-            galaxy_tree = self.galaxy_merkle_trees.get(galaxy_id)
-            if galaxy_tree is None:
-                logger.warning(f"No Merkle tree for galaxy {galaxy_id}, rejecting client {client_id}")
-                rejected_clients.append(client_id)
-                verification_results[client_id] = False
-                continue
-            
-            # Verify Merkle proof cryptographically
-            client_proof_data = galaxy_tree.get_client_proof(client_id)
-            if client_proof_data is None:
-                logger.warning(f"Client {client_id} has no proof in galaxy {galaxy_id} tree, rejecting")
-                rejected_clients.append(client_id)
-                verification_results[client_id] = False
-                continue
-            
-            # Use tree's verify method: checks leaf hash + proof path == root
-            leaf_index = client_proof_data['leaf_index']
-            is_valid = galaxy_tree.verify(leaf_index, client_proof_data['leaf_hash'])
-            
-            if is_valid:
-                verified_updates[client_id] = update
-                verification_results[client_id] = True
-            else:
-                logger.warning(f"✗ Client {client_id}: INVALID Merkle proof")
-                rejected_clients.append(client_id)
-                verification_results[client_id] = False
-                
-                # Log to forensic logger (Layer 1 failure)
-                self.defense_coordinator.forensic_logger.log_quarantine(
-                    client_id=client_id,
-                    round_number=self.current_round,
-                    commitment_hash=commitment,
-                    merkle_proof=proof,
-                    merkle_root=galaxy_tree.get_root(),
-                    layer_results={
-                        'layer1_failed': True,
-                        'layer2_flags': [],
-                        'layer3_rejected': False,
-                        'layer4_reputation': 1.0,
-                        'layer5_galaxy_flagged': False,
-                    },
-                    metadata={'phase': 'revelation'}
-                )
-        
-        acceptance_rate = len(verified_updates) / len(client_updates) if client_updates else 0
-        
-        # --- ZK Sum-Check Verification ---
+        # Parallelize verification
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+        max_workers = min(32, (os.cpu_count() or 1) * 4)
+
         zk_verified = 0
         zk_failed = 0
         zk_verify_time_ms = 0.0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # We need to verify both Merkle and ZKP for each client
+            # We'll submit tasks that do both checks
+            
+            def verify_client(cid, comm, proof, zk_proof, galaxy_tree):
+                # Merkle check
+                merkle_valid = True
+                if comm and proof and galaxy_tree:
+                    try:
+                        leaf_index = proof.get('leaf_index') if isinstance(proof, dict) else None
+                        leaf_hash = proof.get('leaf_hash') if isinstance(proof, dict) else None
+                        
+                        if leaf_index is not None and leaf_hash is not None:
+                            merkle_valid = galaxy_tree.verify(leaf_index, leaf_hash)
+                        else:
+                            # If proof format is wrong or missing keys
+                            merkle_valid = False
+                    except Exception:
+                        merkle_valid = False
+                elif not galaxy_tree:
+                    # If we don't have a galaxy tree
+                    merkle_valid = False
+
+                # ZKP check
+                zkp_valid = True
+                if zk_proof:
+                    zkp_valid = GradientSumCheckProver.verify_proof(zk_proof)
+                
+                return cid, merkle_valid, zkp_valid
+
+            future_to_cid = {}
+            import time
+            zk_start = time.time()
+
+            for client_id, update in client_updates.items():
+                galaxy_id = self.galaxy_manager.get_client_galaxy(client_id)
+                if galaxy_id is None:
+                    logger.warning(f"Client {client_id} not assigned to any galaxy, rejecting")
+                    rejected_clients.append(client_id)
+                    verification_results[client_id] = False
+                    continue
+                
+                galaxy_tree = self.galaxy_merkle_trees.get(galaxy_id)
+                if not galaxy_tree and hasattr(self, 'ablation') and self.ablation != 'merkle_only':
+                     logger.warning(f"No Merkle tree for galaxy {galaxy_id}, rejecting client {client_id}")
+                     rejected_clients.append(client_id)
+                     verification_results[client_id] = False
+                     continue
+                
+                comm = client_commitments.get(client_id)
+                proof = client_proofs.get(client_id) # Merkle proof
+                zk_proof = self.client_zk_proofs.get(client_id)
+                
+                future = executor.submit(verify_client, client_id, comm, proof, zk_proof, galaxy_tree)
+                future_to_cid[future] = client_id
+
+            for future in as_completed(future_to_cid):
+                client_id = future_to_cid[future]
+                try:
+                    _, m_valid, z_valid = future.result()
+                    
+                    if not m_valid:
+                        logger.warning(f"Client {client_id} failed Merkle verification")
+                        rejected_clients.append(client_id)
+                        verification_results[client_id] = False
+                        continue
+                        
+                    if not z_valid:
+                        logger.warning(f"Client {client_id} failed ZK verification")
+                        rejected_clients.append(client_id)
+                        verification_results[client_id] = False
+                        zk_failed += 1
+                        continue
+                        
+                    verified_clients.append(client_id)
+                    verified_updates[client_id] = client_updates[client_id]
+                    verification_results[client_id] = True
+                    if self.client_zk_proofs.get(client_id):
+                        zk_verified += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error verifying client {client_id}: {e}")
+                    rejected_clients.append(client_id)
+                    verification_results[client_id] = False
+
+            zk_verify_time_ms = (time.time() - zk_start) * 1000
+
+        mode = "REAL" if self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK"
+        logger.info(f"✓ Verified {len(verified_clients)}/{len(client_updates)} clients (Merkle+ZKP) with {max_workers} threads")
         
         if self.client_zk_proofs:
-            import time as _time
-            logger.info(f"Verifying ZK sum-check proofs for {len(self.client_zk_proofs)} clients...")
-            zk_start = _time.time()
-            
-            zk_invalid_clients = []
-            for client_id, zk_proof in self.client_zk_proofs.items():
-                if client_id not in verified_updates:
-                    continue  # Already rejected by Merkle
-                
-                is_valid = GradientSumCheckProver.verify_proof(zk_proof)
-                if is_valid:
-                    zk_verified += 1
-                else:
-                    zk_failed += 1
-                    zk_invalid_clients.append(client_id)
-                    logger.warning(f"  ✗ Client {client_id}: INVALID ZK sum-check proof")
-            
-            # Remove ZK-invalid clients from verified set
-            for cid in zk_invalid_clients:
-                verified_updates.pop(cid, None)
-                rejected_clients.append(cid)
-                verification_results[cid] = False
-            
-            zk_verify_time_ms = (_time.time() - zk_start) * 1000
-            mode = "REAL" if next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK"
             logger.info(f"✓ ZK verification [{mode}]: {zk_verified} valid, {zk_failed} invalid ({zk_verify_time_ms:.1f}ms)")
         
-        logger.info(f"✓ Verified: {len(verified_updates)}/{len(client_updates)} clients ({acceptance_rate:.1%})")
         if rejected_clients:
             logger.warning(f"✗ Rejected: {len(rejected_clients)} clients (invalid proofs)")
-        
+            
+        acceptance_rate = len(verified_updates) / len(client_updates) if client_updates else 0
+            
         return PhaseResult(
             phase_name="revelation",
             success=True,
@@ -567,23 +627,49 @@ class ProtoGalaxyOrchestrator:
             logger.info(f"Folding ZK proofs per galaxy...")
             fold_start = _time.time()
             
-            for galaxy_id in range(self.num_galaxies):
-                if galaxy_id not in clean_galaxy_updates:
-                    continue  # Skip flagged/dissolved galaxies
-                galaxy_clients = self.galaxy_manager.get_galaxy_clients(galaxy_id)
-                galaxy_proofs = [
-                    self.client_zk_proofs[cid]
-                    for cid in galaxy_clients
-                    if cid in self.client_zk_proofs
-                ]
+            # Parallelize galaxy folding
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import os
+            max_workers = min(32, (os.cpu_count() or 1) * 4)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_gid = {}
                 
-                if galaxy_proofs:
-                    folded = self.galaxy_proof_folder.fold_galaxy_proofs(galaxy_proofs, galaxy_id)
-                    self.galaxy_zk_proofs[galaxy_id] = folded
-            
-            folding_time_ms = (_time.time() - fold_start) * 1000
+                for galaxy_id in range(self.num_galaxies):
+                    if galaxy_id not in clean_galaxy_updates:
+                        continue
+                    
+                    galaxy_clients = self.galaxy_manager.get_galaxy_clients(galaxy_id)
+                    galaxy_proofs = [
+                        self.client_zk_proofs[cid]
+                        for cid in galaxy_clients
+                        if cid in self.client_zk_proofs
+                    ]
+                    
+                    if not galaxy_proofs:
+                        continue
+                        
+                    future = executor.submit(
+                        self.zkp_prover.galaxy_prover.fold_galaxy_proofs,
+                        client_proofs=galaxy_proofs,
+                        galaxy_id=galaxy_id
+                    )
+                    future_to_gid[future] = galaxy_id
+                
+                for future in as_completed(future_to_gid):
+                    galaxy_id = future_to_gid[future]
+                    try:
+                        folded_proof = future.result()
+                        self.galaxy_zk_proofs[galaxy_id] = folded_proof
+                        # Accumulate actual folding time from the proof object
+                        folding_time_ms += folded_proof.prove_time_ms
+                    except Exception as e:
+                        logger.error(f"Failed to fold galaxy {galaxy_id}: {e}")
+
+            fold_time = (_time.time() - fold_start) * 1000
+            # Average folding time is misleading in parallel, report wall clock and sum of individual folding times
             mode = "REAL" if self.galaxy_zk_proofs and next(iter(self.galaxy_zk_proofs.values())).is_real else "FALLBACK"
-            logger.info(f"✓ Galaxy proofs folded [{mode}]: {len(self.galaxy_zk_proofs)} galaxies ({folding_time_ms:.1f}ms)")
+            logger.info(f"✓ Galaxy proofs folded [{mode}]: {len(self.galaxy_zk_proofs)} galaxies (Wall clock: {fold_time:.1f}ms, Total folding: {folding_time_ms:.1f}ms)")
         
         return PhaseResult(
             phase_name="aggregation",

@@ -51,6 +51,8 @@ def generate_scalability_configs(
     pin_memory: bool,
     prefetch_factor: int,
     use_amp: bool,
+    eval_every: int,
+    model_type: str = None,
 ) -> List[ExperimentConfig]:
     """Generate experiment configurations for scalability benchmarking.
     
@@ -85,13 +87,15 @@ def generate_scalability_configs(
         num_galaxies = min(10, max(2, num_clients // 10))
         
         for dataset in datasets:
-            # Model selection based on dataset
-            if dataset == "mnist":
-                model_type = "linear"
+            # Model selection based on dataset (unless overridden)
+            if model_type:
+                selected_model = model_type
+            elif dataset == "mnist":
+                selected_model = "mnist_cnn"
             elif dataset == "cifar10":
-                model_type = "cifar10_cnn"
+                selected_model = "cifar10_cnn"
             else:
-                model_type = "mlp"
+                selected_model = "mlp"
             
             for partition in partitions:
                 for ablation in ablations:
@@ -107,7 +111,7 @@ def generate_scalability_configs(
                             
                             # Data
                             dataset=dataset,
-                            model_type=model_type,
+                            model_type=selected_model,
                             partition=partition,
                             
                             # Defense (full ProtoGalaxy pipeline)
@@ -130,6 +134,9 @@ def generate_scalability_configs(
                             pin_memory=pin_memory,
                             prefetch_factor=prefetch_factor,
                             use_amp=use_amp,
+                            
+                            # Evaluation
+                            eval_every=eval_every,
                             
                             # Ablation
                             ablation=ablation if ablation != "full" else "",
@@ -274,6 +281,14 @@ def main():
         help="Ablation modes: merkle_only (no ZKP), full (merkle+ZKP) (default: both)",
     )
     
+    # Optimization arguments
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=5,
+        help="Evaluate model every N rounds to save time (default: 5)",
+    )
+    
     # Experiment parameters
     parser.add_argument(
         "--trials",
@@ -327,6 +342,13 @@ def main():
         help="Print experiment matrix without running",
     )
     
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override model type (e.g., simple_cnn, cifar10_small)",
+    )
+    
     args = parser.parse_args()
     
     # Generate experiment matrix
@@ -344,6 +366,8 @@ def main():
         pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor,
         use_amp=args.use_amp,
+        eval_every=args.eval_every,
+        model_type=args.model,
     )
     
     print("\n" + "=" * 80)

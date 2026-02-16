@@ -304,6 +304,9 @@ class ExperimentConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     use_amp: bool = True
+    
+    # Evaluation
+    eval_every: int = 1  # Evaluate every N rounds
 
     def __post_init__(self):
         if not self.experiment_id:
@@ -752,10 +755,21 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         pipeline = None  # We drive vanilla manually
     elif cfg.defense == "multi_krum":
         # Use ProtoGalaxy pipeline but set aggregation to multi_krum
+        # Cap f so 2f + 2 < clients_per_galaxy (user fix for Bug #6)
+        clients_per_galaxy = cfg.num_clients // cfg.num_galaxies
+        max_f = (clients_per_galaxy - 3) // 2
+        krum_f = min(num_byzantine, max_f)
+        if krum_f < 1:
+            logger.warning(
+                f"Galaxy size {clients_per_galaxy} too small for Multi-Krum (f={num_byzantine}). "
+                "Setting f=1 (unsafe) or consider increasing clients/galaxy."
+            )
+            krum_f = 1
+            
         defense_config = {
             "layer3_method": "multi_krum",
-            "layer3_krum_f": max(1, num_byzantine),
-            "layer3_krum_m": max(1, cfg.num_clients // cfg.num_galaxies - num_byzantine - 2),
+            "layer3_krum_f": krum_f,
+            "layer3_krum_m": max(1, clients_per_galaxy - krum_f - 2),
         }
         pipeline = ProtoGalaxyPipeline(
             global_model=global_model,
@@ -765,7 +779,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         )
         logger.info(
             f"  Strategy: Multi-Krum\n"
-            f"  krum_f={defense_config['layer3_krum_f']} (expected Byzantine), "
+            f"  krum_f={defense_config['layer3_krum_f']} (capped for n_gal={clients_per_galaxy}), "
             f"krum_m={defense_config['layer3_krum_m']} (selection count)"
         )
     elif cfg.defense == "fltrust":
@@ -944,8 +958,18 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             )
 
         # ── 5c. Evaluate ──────────────────────────────────────────────
-        accuracy = _evaluate_model(global_model, test_loader, device)
-        rmetrics.accuracy = accuracy
+        # Only evaluate every `eval_every` rounds (and the last round)
+        if (round_num + 1) % cfg.eval_every == 0 or (round_num + 1) == cfg.num_rounds:
+            accuracy = _evaluate_model(global_model, test_loader, device)
+            rmetrics.accuracy = accuracy
+            logger.info(
+                f"Round {round_num}/{cfg.num_rounds} — Eval accuracy: {accuracy:.4f}"
+            )
+        else:
+            # Carry forward previous accuracy if not evaluating
+            # (or 0.0 if not yet evaluated, though R0 is usually evaluated if eval_every=1)
+            # If we skip, we just leave it as 0.0 or the default
+            pass
 
         # ── 5d. Detection metrics ─────────────────────────────────────
         flagged_set = set(rmetrics.flagged_client_ids)
