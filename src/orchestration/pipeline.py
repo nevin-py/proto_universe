@@ -38,6 +38,20 @@ from src.storage.manager import StorageManager
 from src.logging import FLLogger
 
 
+def _zkp_prove_worker(args):
+    """Module-level worker function for parallel ZKP proving (spawn-compatible).
+    
+    Must be at module level for multiprocessing.spawn to pickle correctly.
+    """
+    client_id, grads, round_number, use_bounds = args
+    # Move tensors to CPU for pickling
+    cpu_grads = [g.cpu() if isinstance(g, torch.Tensor) else g for g in grads]
+    # Import here to avoid import-time issues
+    from src.crypto.zkp_prover import GradientSumCheckProver
+    prover = GradientSumCheckProver(use_bounds=use_bounds)
+    return prover.prove_gradient_sum(cpu_grads, client_id, round_number)
+
+
 @dataclass
 class ClientSubmission:
     """Client's gradient submission with cryptographic commitment"""
@@ -312,16 +326,6 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
-    def _parallel_prove_worker(self, args):
-        """Worker function for parallel ZKP proving (must be picklable)."""
-        client_id, grads, round_number, use_bounds = args
-        # Move tensors to CPU for pickling
-        cpu_grads = [g.cpu() if isinstance(g, torch.Tensor) else g for g in grads]
-        # Import here to avoid pickle issues
-        from src.crypto.zkp_prover import GradientSumCheckProver
-        prover = GradientSumCheckProver(use_bounds=use_bounds)
-        return prover.prove_gradient_sum(cpu_grads, client_id, round_number)
-    
     def phase1_generate_zk_proofs(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
@@ -387,7 +391,7 @@ class ProtoGalaxyPipeline:
             # Parallel prove with 'spawn' method (CUDA-compatible)
             ctx = mp.get_context('spawn')
             with ctx.Pool(processes=num_workers) as pool:
-                results = pool.map(self._parallel_prove_worker, work_items)
+                results = pool.map(_zkp_prove_worker, work_items)
             
             # Store results
             for (cid, _, _, _), proof in zip(work_items, results):
