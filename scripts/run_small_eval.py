@@ -304,7 +304,8 @@ def create_summary_report(
             import statistics
             avg_acc = statistics.mean(accuracies)
             std_acc = statistics.stdev(accuracies) if len(accuracies) > 1 else 0.0
-            avg_conv = statistics.mean([c for c in convergences if c >= 0])
+            valid_conv = [c for c in convergences if c >= 0]
+            avg_conv = statistics.mean(valid_conv) if valid_conv else -1
             
             ablation_str = ablation if ablation else "—"
             conv_str = f"{avg_conv:.0f}" if avg_conv >= 0 else "✗"

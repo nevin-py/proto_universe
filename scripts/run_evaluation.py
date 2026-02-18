@@ -881,10 +881,15 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
                 client_grads[cid] for cid in range(cfg.num_clients)
                 if cid not in byzantine_ids
             ]
+            # Reset per-round guard so observe is called exactly once
+            adaptive_attacker._observed_this_round = False
+            # Generate ONE poison (all Byzantine share it; avoids
+            # triple observe_round per FL round with 3 Byzantine)
+            poison = adaptive_attacker.generate_adaptive_poison(
+                honest_grads_list, attack_goal="untargeted",
+            )
             for cid in byzantine_ids:
-                client_grads[cid] = adaptive_attacker.generate_adaptive_poison(
-                    honest_grads_list, attack_goal="untargeted",
-                )
+                client_grads[cid] = poison
         elif cfg.attack == "sybil" and sybil_coordinator is not None:
             honest_grads_dict = {
                 cid: client_grads[cid] for cid in range(cfg.num_clients)

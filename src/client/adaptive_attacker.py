@@ -83,6 +83,9 @@ class AdaptiveAttacker:
         self._std_norm: float = 0.5
         self._centroid: Optional[np.ndarray] = None
 
+        # Guard against multiple observe calls per round
+        self._observed_this_round: bool = False
+
     # ------------------------------------------------------------------
     # Observation
     # ------------------------------------------------------------------
@@ -130,6 +133,7 @@ class AdaptiveAttacker:
         self._centroid = centroid
 
         self._round_count += 1
+        self._observed_this_round = True
 
     @property
     def is_ready(self) -> bool:
@@ -176,8 +180,30 @@ class AdaptiveAttacker:
         if not honest_gradients:
             raise ValueError("Cannot generate adaptive poison without honest gradients.")
 
-        # Always update observation
-        self.observe_round(honest_gradients)
+        # Determine target device from input gradients
+        _device = None
+        for g in honest_gradients[0]:
+            if isinstance(g, torch.Tensor):
+                _device = g.device
+                break
+
+        # Check readiness BEFORE updating observation
+        was_ready = self.is_ready
+
+        # Update observation (only if not already called this round)
+        if not self._observed_this_round:
+            self.observe_round(honest_gradients)
+
+        # During observation window: return honest gradient (stealth mode)
+        if not was_ready:
+            logger.debug(
+                "Adaptive stealth mode (round %d/%d) — submitting honest gradient",
+                self._round_count, self.observation_window,
+            )
+            avg = average_gradients(honest_gradients)
+            if _device is not None:
+                avg = [t.to(_device) if isinstance(t, torch.Tensor) else t for t in avg]
+            return avg
 
         # Reference shapes from first honest gradient
         reference_shapes = [
@@ -197,21 +223,28 @@ class AdaptiveAttacker:
         # ------------------------------------------------------------------
         # Adversarial direction
         # ------------------------------------------------------------------
+        # Generate a random orthogonal component (Gram-Schmidt)
+        rng = np.random.RandomState(self._round_count)
+        rand_component = rng.randn(len(centroid_unit)).astype(np.float32)
+        proj = np.dot(rand_component, centroid_unit) * centroid_unit
+        orth = rand_component - proj
+        orth_norm = float(np.linalg.norm(orth))
+        if orth_norm > 1e-12:
+            orth = orth / orth_norm
+
         if attack_goal == "untargeted":
-            # Maximise global loss by reversing the honest direction
-            adv_direction = -centroid_unit
+            # Strategy: move model in a mostly-orthogonal direction that
+            # corrupts decision boundaries while maintaining positive
+            # cosine with centroid.  Pure -c is useless because the
+            # cosine constraint forces the blend back to ~+c.
+            # Instead: 90% orthogonal + 10% anti-centroid
+            adv_direction = 0.95 * orth - 0.31 * centroid_unit
+            adv_norm = float(np.linalg.norm(adv_direction))
+            if adv_norm > 1e-12:
+                adv_direction = adv_direction / adv_norm
         elif attack_goal == "targeted":
-            # Targeted: bias toward a random perturbation that is
-            # orthogonal to centroid, plus a negation component.
-            # This subtly moves the decision boundary for the target class.
-            rand_component = np.random.randn(len(centroid_unit)).astype(np.float32)
-            # Gram-Schmidt: orthogonalise w.r.t. centroid
-            proj = np.dot(rand_component, centroid_unit) * centroid_unit
-            orth = rand_component - proj
-            orth_norm = float(np.linalg.norm(orth))
-            if orth_norm > 1e-12:
-                orth = orth / orth_norm
-            # Mix negation and orthogonal
+            # Targeted: bias toward a random orthogonal perturbation
+            # plus a negation component.
             adv_direction = -0.5 * centroid_unit + 0.5 * orth
             adv_norm = float(np.linalg.norm(adv_direction))
             if adv_norm > 1e-12:
@@ -261,13 +294,16 @@ class AdaptiveAttacker:
         # Unflatten back to per-parameter tensors
         poisoned_tensors = unflatten_gradients(poisoned_flat, reference_shapes)
 
-        # Convert to torch tensors
+        # Convert to torch tensors (on same device as input)
         result = []
         for t in poisoned_tensors:
             if isinstance(t, np.ndarray):
-                result.append(torch.tensor(t, dtype=torch.float32))
+                tensor = torch.tensor(t, dtype=torch.float32)
             else:
-                result.append(t)
+                tensor = t
+            if _device is not None and isinstance(tensor, torch.Tensor):
+                tensor = tensor.to(_device)
+            result.append(tensor)
 
         logger.debug(
             "Adaptive poison: α=%.3f  norm=%.4f (target=%.4f)  cos=%.4f",
