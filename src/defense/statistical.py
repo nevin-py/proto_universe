@@ -1,7 +1,7 @@
 """Statistical defense mechanisms for Byzantine-resilient aggregation
 
 This module implements the 4-metric statistical analyzer (Architecture Section 4.2):
-1. Norm deviation (threshold: 3σ)
+1. Norm deviation (threshold: 3sigma)
 2. Direction similarity (cosine threshold: 0.5)
 3. Coordinate-wise analysis (per-dimension outliers)
 4. Distribution shift detection (KL-divergence)
@@ -29,7 +29,7 @@ class StatisticalAnalyzer:
     Multi-metric anomaly detection for client gradients (Architecture Section 4.2).
     
     Implements 4 detection metrics:
-    1. Norm deviation - flags gradients with unusual L2 norms (>3σ from mean)
+    1. Norm deviation - flags gradients with unusual L2 norms (>3sigma from mean)
     2. Direction similarity - flags gradients with low cosine similarity to mean (<0.5)
     3. Coordinate-wise analysis - flags gradients with outlier coordinates
     4. Distribution shift - flags gradients with high KL-divergence from aggregate
@@ -159,7 +159,7 @@ class StatisticalAnalyzer:
         Metric 2: Detect gradients with abnormal direction (low cosine similarity).
         
         Uses coordinate-wise **median** as the reference gradient instead
-        of the mean, so that Byzantine clients (even at -10× scale)
+        of the mean, so that Byzantine clients (even at -10x scale)
         cannot flip the reference direction.
         """
         ref_gradient = np.median(flattened, axis=0)

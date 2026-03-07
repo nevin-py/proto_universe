@@ -87,10 +87,6 @@ class SybilCoordinator:
         self._round_count: int = 0
         self._attack_log: List[Dict] = []
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def coordinate_attack(
         self,
         round_number: int,
@@ -155,10 +151,6 @@ class SybilCoordinator:
         self._attack_log.append(log_entry)
         return result
 
-    # ------------------------------------------------------------------
-    # Strategy selection
-    # ------------------------------------------------------------------
-
     def _select_attacking_ids(self, round_number: int) -> Set[int]:
         """Choose which Sybil IDs attack this round."""
         if self.strategy == self.STRATEGY_SYNCHRONIZED:
@@ -175,10 +167,6 @@ class SybilCoordinator:
             return set(self.sybil_ids)  # All attack after sleeper phase
 
         return set()
-
-    # ------------------------------------------------------------------
-    # Poison computation
-    # ------------------------------------------------------------------
 
     def _compute_poison(
         self,
@@ -225,9 +213,6 @@ class SybilCoordinator:
 
         return poisoned
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     def get_attack_log(self) -> List[Dict]:
         """Return history of per-round attack decisions."""

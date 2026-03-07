@@ -3,7 +3,7 @@
 Test Script: 500 Clients MNIST IID
 
 Quick test run with 500 clients on MNIST IID to validate scalability
-and ProtoGalaxy pipeline performance at large scale.
+and FiZK pipeline performance at large scale.
 
 Usage:
     python test_500_clients.py
@@ -170,11 +170,11 @@ def main():
                 print(f"    VRAM:  avg={ru['gpu_mem_allocated_mb']['mean']:.0f} MB, peak={ru['gpu_mem_allocated_mb']['max']:.0f} MB")
         
         print("=" * 80)
-        print(f"\n✓ Test completed successfully!")
+        print(f"\n:) Test completed successfully!")
         print(f"  Results saved to: {args.output_dir}/")
         
     except Exception as e:
-        logger.error(f"✗ Test failed: {e}")
+        logger.error(f"x Test failed: {e}")
         import traceback
         logger.debug(traceback.format_exc())
         sys.exit(1)

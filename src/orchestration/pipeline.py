@@ -83,7 +83,7 @@ class ProtoGalaxyPipeline:
     Complete end-to-end ProtoGalaxy FL pipeline.
     
     Implements the architecture flow from Section 3:
-    - Phase 1: Commitment (clients → galaxy → global)
+    - Phase 1: Commitment (clients -> galaxy -> global)
     - Phase 2: Revelation (clients send gradients with proofs)
     - Phase 3: Multi-Layer Defense (4 defense layers)
     - Phase 4: Global Aggregation (final model update)
@@ -325,7 +325,7 @@ class ProtoGalaxyPipeline:
         Uses L2 norms — NOT scalar sums — because gradient values tend to
         cancel out in large tensors, making sums ≈ 0 for both honest and
         malicious clients.  L2 norms scale proportionally with attack
-        magnitude (e.g. 10× scaling → 10× norm).
+        magnitude (e.g. 10x scaling -> 10x norm).
 
         This prevents malicious clients from setting their own bounds.
         """
@@ -355,7 +355,7 @@ class ProtoGalaxyPipeline:
         Phase 1: Generate ZK sum-check proofs for all clients.
         
         Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
-          z_0 = 0  →  z_1 = z_0 + sum(layer_0)  →  ...  →  z_n = total_sum
+          z_0 = 0  ->  z_1 = z_0 + sum(layer_0)  ->  ...  ->  z_n = total_sum
         
         Global norm bounds are computed server-side from robust statistics
         (median + k*MAD) across ALL clients' gradient norms.  Malicious clients
@@ -365,7 +365,7 @@ class ProtoGalaxyPipeline:
         Architecture Section 3.3 — Commitment Generator + ZK verification.
         
         Args:
-            client_gradients: Dict mapping client_id → List[torch.Tensor]
+            client_gradients: Dict mapping client_id -> List[torch.Tensor]
             round_number: Current FL round
             
         Returns:
@@ -404,7 +404,7 @@ class ProtoGalaxyPipeline:
                     zk_bound_failures += 1
                     if self.logger:
                         self.logger.logger.info(
-                            f"  Client {client_id}: ✗ REJECTED — norm violations [{', '.join(violation_layers)}]"
+                            f"  Client {client_id}: x REJECTED — norm violations [{', '.join(violation_layers)}]"
                         )
                     continue  # Skip proof generation — client rejected
 

@@ -15,15 +15,15 @@ Configuration:
   • 1 trial per config (seed 42)
 
 At 40% Byzantine (4/10):
-  Krum f=4, per-galaxy: 5 clients, 4 Byzantine → krum_m = max(1, 5-4-2) = 1
+  Krum f=4, per-galaxy: 5 clients, 4 Byzantine -> krum_m = max(1, 5-4-2) = 1
   Krum selects only 1 client per galaxy — thin margin.
 
 At 50% Byzantine (5/10):
-  Krum f=5, per-galaxy: 5 clients, 5 Byzantine → krum_m = max(1, 5-5-2) = 1
+  Krum f=5, per-galaxy: 5 clients, 5 Byzantine -> krum_m = max(1, 5-5-2) = 1
   Krum cannot guarantee honest selection — may select malicious clients.
 
 Experiment Matrix:
-  2 byz_fractions × 4 defenses × 1 trial = 8 experiments
+  2 byz_fractions x 4 defenses x 1 trial = 8 experiments
   Estimated: ~15 min
 
 Usage:
@@ -193,7 +193,7 @@ def main():
         if r:
             results.append(r)
             status = "OK" if r["exit_code"] == 0 else f"FAIL (exit {r['exit_code']})"
-            print(f"  → {status} in {r['elapsed_time']:.1f}s")
+            print(f"  -> {status} in {r['elapsed_time']:.1f}s")
 
     # Summary
     print(f"\n\n{'='*80}")
@@ -206,7 +206,7 @@ def main():
     print(f"  Total time: {total_time:.0f}s ({total_time/60:.1f} min)")
 
     for r in results:
-        status = "✓" if r["exit_code"] == 0 else "✗"
+        status = ":)" if r["exit_code"] == 0 else "x"
         print(f"  {status} {r['experiment_id']}  ({r['elapsed_time']:.0f}s)")
 
     print(f"\nResults saved to: {output_dir}/custom/")

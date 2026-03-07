@@ -2,7 +2,7 @@
 """
 Scalability Benchmark Script
 
-Evaluates ProtoGalaxy performance across varying client counts (20-500)
+Evaluates FiZK performance across varying client counts (20-500)
 with Merkle-only vs Merkle+ZKP configurations.
 
 Usage:
@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import List, Dict
 
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.run_evaluation import (
@@ -105,7 +104,7 @@ def generate_scalability_configs(
                             model_type=model_type,
                             partition=partition,
                             
-                            # Defense (full ProtoGalaxy pipeline)
+                            # Defense (full FiZK pipeline)
                             defense="protogalaxy_full",
                             aggregation_method="trimmed_mean",
                             trim_ratio=0.1,
@@ -197,7 +196,6 @@ def save_scalability_summary(
     
     logger.info(f"Scalability summary saved to {summary_path}")
     
-    # Print table
     print("\n" + "=" * 120)
     print("  SCALABILITY BENCHMARK SUMMARY")
     print("=" * 120)
@@ -225,7 +223,7 @@ def save_scalability_summary(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ProtoGalaxy Scalability Benchmark",
+        description="FiZK Scalability Benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -322,7 +320,7 @@ def main():
     )
     
     print("\n" + "=" * 80)
-    print("  ProtoGalaxy Scalability Benchmark")
+    print("  FiZK Scalability Benchmark")
     print("=" * 80)
     print(f"  Client counts:    {args.clients}")
     print(f"  Datasets:         {args.datasets}")
@@ -345,7 +343,6 @@ def main():
         print(f"\n  Total: {len(configs)} experiments")
         return
     
-    # Run experiments
     from scripts.run_evaluation import _is_completed, _save_result
     
     all_results: List[ExperimentResult] = []
@@ -359,7 +356,7 @@ def main():
         print(f"{'─' * 80}")
         
         if args.resume and _is_completed(cfg, args.output_dir):
-            logger.info(f"  ✓ Already completed — skipping")
+            logger.info(f"  :) Already completed — skipping")
             continue
         
         try:
@@ -367,14 +364,13 @@ def main():
             _save_result(result, args.output_dir)
             all_results.append(result)
         except Exception as e:
-            logger.error(f"  ✗ Failed: {e}")
+            logger.error(f"  x Failed: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             failed.append((cfg.experiment_id, str(e)))
     
     elapsed = time.time() - start_time
     
-    # Summaries
     print_summary(all_results)
     
     if all_results:

@@ -165,7 +165,7 @@ class EnhancedReputationManager:
         # Architecture Section 4.4: "R(t+1) = (1-λ)·R(t) + λ·B(t), λ = 0.1"
         # Apply EWMA at the top-level reputation score so that reputation
         # changes gradually rather than being directly overwritten.
-        lambda_lr = 1.0 - self.decay_factor  # decay_factor = 0.9 → λ = 0.1
+        lambda_lr = 1.0 - self.decay_factor  # decay_factor = 0.9 -> λ = 0.1
         old_score = self.reputation_scores.get(client_id, 0.5)
         smoothed_score = (1.0 - lambda_lr) * old_score + lambda_lr * new_score
         self.reputation_scores[client_id] = smoothed_score

@@ -6,8 +6,8 @@ with open("requirements.txt") as f:
 setup(
     name="proto_universe",
     version="0.1.0",
-    description="ProtoGalaxy: Privacy-preserving federated learning with 5-layer Byzantine-resilient defense and ZKP verification",
-    author="ProtoGalaxy Team",
+    description="FiZK: Privacy-preserving federated learning with 5-layer Byzantine-resilient defense and ZKP verification",
+    author="FiZK Team",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     python_requires=">=3.9",

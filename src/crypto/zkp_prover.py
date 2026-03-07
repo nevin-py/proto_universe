@@ -249,7 +249,7 @@ class GradientSumCheckProver:
         elapsed_ms = (time.time() - start) * 1000
         logger.debug(
             f"  ZK verify client {proof.client_id}: "
-            f"{'✓ VALID' if valid else '✗ INVALID'} ({elapsed_ms:.1f}ms)"
+            f"{':) VALID' if valid else 'x INVALID'} ({elapsed_ms:.1f}ms)"
         )
         return valid
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProtoGalaxy Comprehensive Evaluation Script
+FiZK Comprehensive Evaluation Script
 =============================================
 
 Runs reproducible FL experiments across every combination of:
@@ -9,11 +9,7 @@ Runs reproducible FL experiments across every combination of:
                       backdoor | gaussian_noise | adaptive | sybil
   - Data partitions:  iid | noniid | dirichlet
   - Ablation modes:   merkle_only | zk_merkle
-  - Scale configs:    varying num_clients × num_galaxies
-
-Every evaluation uses ONLY real, implemented architecture functions — no mock,
-stub, or placeholder logic.  Components that are not yet implemented will raise
-a clear error pointing to ``eval_tbd.md``.
+  - Scale configs:    varying num_clients x num_galaxies
 
 Usage
 -----
@@ -48,7 +44,7 @@ Assumptions
 -----------
 1. MNIST dataset will be auto-downloaded to ``./data`` on first run.
 2. CIFAR-10 experiments require separate download (``--dataset cifar10``).
-3. The Rust ZKP bridge (``fl_zkp_bridge``) must be compiled for REAL mode:
+3. The Rust ZKP bridge (``fl_zkp_bridge``) must be compiled:
        cd sonobe/fl-zkp-bridge && maturin develop --release
    If unavailable, ZKP falls back to SHA-256 commitments and ablation will
    note this in the results JSON.
@@ -155,13 +151,9 @@ try:
     ZKP_PERF_AVAILABLE = True
     ATTACK_REJECTION_AVAILABLE = True
 except ImportError as e:
-    # Logger may not be configured yet, just set availability flags
     ZKP_PERF_AVAILABLE = False
     ATTACK_REJECTION_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 SUPPORTED_DEFENSES = ("vanilla", "multi_krum", "fltrust", "protogalaxy_full")
 SUPPORTED_ATTACKS = (
     "none",
@@ -181,10 +173,6 @@ EVAL_MODES = (
 )
 EVAL_TBD_PATH = PROJECT_ROOT / "eval_tbd.md"
 
-
-# ============================================================================
-# System Resource Monitor
-# ============================================================================
 
 class SystemResourceMonitor:
     """Tracks CPU, GPU, and RAM usage during experiment execution.
@@ -256,11 +244,6 @@ class SystemResourceMonitor:
                     'std': float(np.std(values)),
                 }
         return stats
-
-
-# ============================================================================
-# Data classes
-# ============================================================================
 
 @dataclass
 class ExperimentConfig:
@@ -448,11 +431,6 @@ class ExperimentResult:
         }
         return d
 
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
 def _convergence_round(accuracies: List[float], target: float) -> int:
     for i, acc in enumerate(accuracies):
         if acc >= target:
@@ -564,10 +542,6 @@ def _inject_attack(
 ) -> List[torch.Tensor]:
     """Apply attack to a Byzantine client's gradients.
 
-    Uses the **same** attack logic as ``src.client.client.Client`` methods
-    (``_attack_label_flip``, ``_attack_model_poisoning``, etc.) but applied
-    inline so we don't depend on the ``Client`` class orchestration path.
-
     Parameters
     ----------
     gradients : list of Tensor
@@ -653,10 +627,6 @@ def _check_fltrust_available():
         return False
 
 
-# ============================================================================
-# Core experiment runner
-# ============================================================================
-
 def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     """Execute one complete FL experiment end-to-end.
 
@@ -673,12 +643,10 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     ExperimentResult
         All collected metrics.
     """
-    # ── Pre-flight checks ──────────────────────────────────────────────
     _set_seed(cfg.seed)
     result = ExperimentResult(config=cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Start resource monitoring
     resource_monitor = SystemResourceMonitor(sample_interval=2.0)
     resource_monitor.start()
     logger.debug("SystemResourceMonitor started (interval=2.0s)")
@@ -698,7 +666,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         logger.info(f"  Ablation:     {cfg.ablation}")
     logger.info("-" * 72)
 
-    # ── 1. Load data ───────────────────────────────────────────────────
     logger.info("[Phase: DATA] Loading dataset and partitioning...")
     train_dataset, test_dataset = _load_dataset(cfg.dataset)
     partitions = _partition_data(
@@ -710,7 +677,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     )
     test_loader = create_test_loader(test_dataset, batch_size=256)
 
-    # ── 2. Create model ───────────────────────────────────────────────
     logger.info("[Phase: MODEL] Creating and initializing model...")
     global_model = _create_model(cfg.dataset, cfg.model_type).to(device)
     num_params = count_parameters(global_model)
@@ -722,9 +688,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         f"  Initial accuracy: {initial_accuracy:.4f} ({initial_accuracy:.2%})"
     )
 
-    # ── 3. Byzantine setup ─────────────────────────────────────────────
     num_byzantine = int(cfg.num_clients * cfg.byzantine_fraction)
-    # RANDOMIZE malicious client selection for better diversity (not just first N)
     if num_byzantine > 0:
         import random
         rng = random.Random(cfg.seed)  # Reproducible randomization
@@ -738,14 +702,11 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         byzantine_ids: Set[int] = set()
         logger.info("[Phase: BYZANTINE] No Byzantine clients (clean run)")
 
-    # ── 4. Build pipeline or vanilla path ──────────────────────────────
     logger.info(f"[Phase: DEFENSE] Configuring defense: {cfg.defense}")
-    # Defense config passed to DefenseCoordinator inside ProtoGalaxyPipeline
     if cfg.defense == "vanilla":
         logger.info("  Strategy: Vanilla FedAvg — no defense, simple averaging")
         pipeline = None  # We drive vanilla manually
     elif cfg.defense == "multi_krum":
-        # Use ProtoGalaxy pipeline but set aggregation to multi_krum
         defense_config = {
             "layer3_method": "multi_krum",
             "layer3_krum_f": max(1, num_byzantine),
@@ -763,8 +724,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             f"krum_m={defense_config['layer3_krum_m']} (selection count)"
         )
     elif cfg.defense == "fltrust":
-        # FLTrust: use a small clean root dataset held by the server
-        # Take a random 500-sample subset of training data as server root
         rng = np.random.RandomState(cfg.seed)
         root_indices = rng.choice(len(train_dataset), size=min(500, len(train_dataset)), replace=False)
         from torch.utils.data import Subset as _Subset
@@ -776,7 +735,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             learning_rate=cfg.learning_rate,
             batch_size=cfg.batch_size,
         )
-        # Build pipeline with trimmed_mean as L3 (FLTrust replaces aggregation in the round)
         defense_config = {
             "layer3_method": "trimmed_mean",
             "layer3_trim_ratio": cfg.trim_ratio,
@@ -814,7 +772,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     else:
         raise ValueError(f"Unknown defense: {cfg.defense}")
 
-    # ── Adaptive / Sybil attack state ──────────────────────────────────
     adaptive_attacker = None
     sybil_coordinator = None
     if cfg.attack == "adaptive":
@@ -840,7 +797,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             f"sybil_ids={sorted(byzantine_ids)}, scale={cfg.attack_scale}"
         )
 
-    # ── 5. Training loop ───────────────────────────────────────────────
     logger.info("")
     logger.info(f"[Phase: TRAINING] Starting FL training — {cfg.num_rounds} rounds")
     logger.info("-" * 72)
@@ -851,7 +807,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         round_start = time.perf_counter()
         logger.debug(f"Round {round_num}/{cfg.num_rounds} — starting local training")
 
-        # ── 5a. Local training ─────────────────────────────────────────
         client_trainers: Dict[int, Trainer] = {}
         client_grads: Dict[int, List[torch.Tensor]] = {}
 
@@ -862,8 +817,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             trainer.train(loader, num_epochs=cfg.local_epochs)
             grads = trainer.get_gradients()
 
-            # Inject attack for Byzantine clients (skip adaptive/sybil here —
-            # they are handled after all clients train so they can see honest grads)
             if cid in byzantine_ids and cfg.attack not in ("none", "adaptive", "sybil"):
                 grads = _inject_attack(
                     grads, cfg.attack, cid,
@@ -875,16 +828,12 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             client_trainers[cid] = trainer
             client_grads[cid] = grads
 
-        # ── 5a-post. Adaptive / Sybil attack (needs all honest grads) ─
         if cfg.attack == "adaptive" and adaptive_attacker is not None:
             honest_grads_list = [
                 client_grads[cid] for cid in range(cfg.num_clients)
                 if cid not in byzantine_ids
             ]
-            # Reset per-round guard so observe is called exactly once
             adaptive_attacker._observed_this_round = False
-            # Generate ONE poison (all Byzantine share it; avoids
-            # triple observe_round per FL round with 3 Byzantine)
             poison = adaptive_attacker.generate_adaptive_poison(
                 honest_grads_list, attack_goal="untargeted",
             )
@@ -906,11 +855,9 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             for cid, poisoned_grads in sybil_result.items():
                 client_grads[cid] = poisoned_grads
 
-        # ── 5a-fltrust. Compute server update before aggregation ───────
         if cfg.defense == "fltrust":
             fltrust_agg.compute_server_update(global_model)
 
-        # ── 5b. Execute round (defense-dependent) ─────────────────────
         if cfg.defense == "vanilla":
             rmetrics = _run_vanilla_round(
                 global_model, client_grads, rmetrics, device,
@@ -925,11 +872,9 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
                 round_num, cfg, rmetrics, byzantine_ids,
             )
 
-        # ── 5c. Evaluate ──────────────────────────────────────────────
         accuracy = _evaluate_model(global_model, test_loader, device)
         rmetrics.accuracy = accuracy
 
-        # ── 5d. Detection metrics ─────────────────────────────────────
         flagged_set = set(rmetrics.flagged_client_ids)
         honest_ids = set(range(cfg.num_clients)) - byzantine_ids
         tp = len(flagged_set & byzantine_ids)
@@ -955,7 +900,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         rmetrics.round_time = time.perf_counter() - round_start
         result.rounds.append(rmetrics)
 
-        # Detailed per-round log (every round to DEBUG, periodic to INFO)
         round_log = (
             f"Round {round_num:>3d}/{cfg.num_rounds}  "
             f"acc={accuracy:.4f}  loss={rmetrics.loss:.4f}  "
@@ -982,17 +926,14 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             f"verify={rmetrics.merkle_verify_time:.4f}s"
         )
 
-        # Always log full detail to DEBUG
         logger.debug(round_log)
         logger.debug(timing_log)
         logger.debug(zkp_log)
         logger.debug(merkle_log)
 
-        # Periodic summary to INFO
         if round_num % max(1, cfg.num_rounds // 10) == 0 or round_num == cfg.num_rounds - 1:
             logger.info(round_log)
 
-    # ── 6. Finalize results ────────────────────────────────────────────
     logger.info("")
     logger.info("[Phase: FINALIZE] Aggregating results and collecting metrics...")
 
@@ -1067,10 +1008,6 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     return result
 
 
-# ============================================================================
-# Round execution paths
-# ============================================================================
-
 def _run_vanilla_round(
     global_model: nn.Module,
     client_grads: Dict[int, List[torch.Tensor]],
@@ -1084,7 +1021,6 @@ def _run_vanilla_round(
     """
     all_grads_list = list(client_grads.values())
 
-    # average_gradients expects list of gradient-lists
     avg_grads = average_gradients(all_grads_list)
 
     # Apply to global model: w_new = w - lr * avg_grad (lr=1.0 for FedAvg)
@@ -1108,13 +1044,6 @@ def _run_fltrust_round(
     rmetrics: RoundMetrics,
     device: str,
 ) -> RoundMetrics:
-    """FLTrust round: trust-score-weighted aggregation.
-
-    Uses the ``FLTrustAggregator`` which has already computed the server
-    gradient via ``compute_server_update()`` earlier in the round.
-    Client updates are scored by cosine similarity to the server reference
-    update, then normalised and weighted-averaged.
-    """
     # Build updates list in the format FLTrust expects
     updates = [
         {"client_id": cid, "gradients": grads}
@@ -1244,10 +1173,6 @@ def _run_protogalaxy_round(
         f"zk_prove={rmetrics.zk_prove_time:.3f}s ({rmetrics.zk_proofs_generated} proofs"
         f"{f', {zk_bf} bound violations' if zk_bf else ''})"
     )
-
-    # ==========================
-    # PHASE 2: REVELATION
-    # ==========================
     phase2_start = time.perf_counter()
 
     galaxy_verified: Dict[int, List[Dict]] = {}
@@ -1302,9 +1227,6 @@ def _run_protogalaxy_round(
         f"zk_fail={rmetrics.zk_proofs_failed}"
     )
 
-    # ==========================
-    # PHASE 3: DEFENSE
-    # ==========================
     phase3_start = time.perf_counter()
 
     galaxy_agg_grads = {}
@@ -1343,9 +1265,6 @@ def _run_protogalaxy_round(
         f"flagged={sorted(round_flagged)}"
     )
 
-    # ==========================
-    # PHASE 4: GLOBAL AGGREGATION
-    # ==========================
     phase4_start = time.perf_counter()
 
     verified_galaxies, rejected_galaxies = pipeline.phase4_global_verify_galaxies(
@@ -1396,10 +1315,6 @@ def _run_protogalaxy_round(
     return rmetrics
 
 
-# ============================================================================
-# Experiment matrix generators
-# ============================================================================
-
 def _gen_baseline_configs(
     trials: int, base_seed: int, num_rounds: int,
 ) -> List[ExperimentConfig]:
@@ -1423,7 +1338,7 @@ def _gen_baseline_configs(
 def _gen_attack_configs(
     trials: int, base_seed: int, num_rounds: int,
 ) -> List[ExperimentConfig]:
-    """All defense × attack × byzantine fraction combinations."""
+    """All defense x attack x byzantine fraction combinations."""
     defenses = ["vanilla", "multi_krum", "protogalaxy_full"]
     # Exclude not-yet-implemented attacks and fltrust
     attacks = ["label_flip", "targeted_label_flip", "model_poisoning",
@@ -1476,7 +1391,7 @@ def _gen_ablation_configs(
 def _gen_scalability_configs(
     trials: int, base_seed: int, num_rounds: int,
 ) -> List[ExperimentConfig]:
-    """Scalability: vary clients × galaxies across defenses and attacks."""
+    """Scalability: vary clients x galaxies across defenses and attacks."""
     scale_points = [
         {"num_clients": 10, "num_galaxies": 2},
         {"num_clients": 20, "num_galaxies": 4},
@@ -1565,10 +1480,6 @@ def generate_experiment_matrix(
     raise ValueError(f"Unknown mode: {mode}")
 
 
-# ============================================================================
-# Result I/O
-# ============================================================================
-
 def _results_dir(output_dir: str, mode: str) -> Path:
     p = Path(output_dir) / mode
     p.mkdir(parents=True, exist_ok=True)
@@ -1581,7 +1492,7 @@ def _save_result(result: ExperimentResult, output_dir: str):
     filepath = rdir / filename
     with open(filepath, "w") as f:
         json.dump(result.to_dict(), f, indent=2, default=str)
-    logger.info(f"  Saved → {filepath}")
+    logger.info(f"  Saved -> {filepath}")
 
 
 def _is_completed(cfg: ExperimentConfig, output_dir: str) -> bool:
@@ -1589,10 +1500,6 @@ def _is_completed(cfg: ExperimentConfig, output_dir: str) -> bool:
     filepath = rdir / f"{cfg.experiment_id}.json"
     return filepath.exists()
 
-
-# ============================================================================
-# Summary / reporting
-# ============================================================================
 
 def run_zkp_performance_evaluation(trials: int, output_dir: str) -> bool:
     """Run ZKP performance benchmarking.
@@ -1605,9 +1512,9 @@ def run_zkp_performance_evaluation(trials: int, output_dir: str) -> bool:
     
     try:
         from fl_zkp_bridge import FLZKPBoundedProver
-        logger.info("✓ Rust ZKP module loaded\n")
+        logger.info(":) Rust ZKP module loaded\n")
     except ImportError:
-        logger.error("✗ Rust ZKP module not available")
+        logger.error("x Rust ZKP module not available")
         logger.error("  Build with: cd sonobe/fl-zkp-bridge && maturin develop --release")
         return False
     
@@ -1630,7 +1537,7 @@ def run_zkp_performance_evaluation(trials: int, output_dir: str) -> bool:
     with open(results_file, 'w') as f:
         json.dump(evaluator.results, f, indent=2)
     
-    logger.info(f"\n✓ Results saved to {results_file}")
+    logger.info(f"\n:) Results saved to {results_file}")
     return True
 
 
@@ -1645,9 +1552,9 @@ def run_attack_rejection_evaluation(trials: int, output_dir: str) -> bool:
     
     try:
         from fl_zkp_bridge import FLZKPBoundedProver
-        logger.info("✓ Rust ZKP module loaded\n")
+        logger.info(":) Rust ZKP module loaded\n")
     except ImportError:
-        logger.error("✗ Rust ZKP module not available")
+        logger.error("x Rust ZKP module not available")
         logger.error("  Build with: cd sonobe/fl-zkp-bridge && maturin develop --release")
         return False
     
@@ -1670,7 +1577,7 @@ def run_attack_rejection_evaluation(trials: int, output_dir: str) -> bool:
     with open(results_file, 'w') as f:
         json.dump(evaluator.results, f, indent=2)
     
-    logger.info(f"\n✓ Results saved to {results_file}")
+    logger.info(f"\n:) Results saved to {results_file}")
     return True
 
 
@@ -1985,7 +1892,7 @@ def main():
         print(f"{'─' * 70}")
 
         if args.resume and _is_completed(cfg, args.output_dir):
-            logger.info(f"  ✓ Already completed — skipping")
+            logger.info(f"  :) Already completed — skipping")
             continue
 
         try:
@@ -1996,7 +1903,7 @@ def main():
             logger.warning(f"  ⚠ Skipped (not implemented): {e}")
             failed.append((cfg.experiment_id, str(e)))
         except Exception as e:
-            logger.error(f"  ✗ Failed: {e}")
+            logger.error(f"  x Failed: {e}")
             logger.debug(traceback.format_exc())
             failed.append((cfg.experiment_id, str(e)))
 

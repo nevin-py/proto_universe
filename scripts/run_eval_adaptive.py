@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Small-Scale ProtoGalaxy Evaluation — Adaptive Attack
+Small-Scale FiZK Evaluation — Adaptive Attack
 =====================================================
 
 Runs evaluation for the adaptive adversary that observes honest gradient
@@ -9,7 +9,7 @@ statistics and crafts evasive poisons staying within norm/cosine bounds.
 The adaptive attacker has a 5-round observation window (stealth mode),
 then poisons rounds 5-9 (untargeted: reverses honest centroid direction).
 
-With 10 rounds → 5 poison rounds.  With 20 rounds → 15 poison rounds.
+With 10 rounds -> 5 poison rounds.  With 20 rounds -> 15 poison rounds.
 
 Configuration:
   • 10 clients, 2 galaxies (5 clients/galaxy)
@@ -18,16 +18,6 @@ Configuration:
   • Byzantine fraction: 30% (3 malicious clients, randomized)
   • Partition: IID only
   • Defenses: vanilla, multi_krum, protogalaxy_full (merkle_only, zk_merkle)
-
-Estimated Time (10 rounds):
-  1 attack × 4 defense configs × 2 trials = 8 experiments
-  = 2 vanilla (~40s) + 2 multi_krum (~40s) + 2 merkle_only (~50s) + 2 zk_merkle (~200s)
-  ≈ 11 min total
-
-Estimated Time (20 rounds):
-  1 attack × 4 defense configs × 2 trials = 8 experiments
-  = 2 vanilla (~80s) + 2 multi_krum (~80s) + 2 merkle_only (~100s) + 2 zk_merkle (~400s)
-  ≈ 22 min total
 
 Usage:
     python scripts/run_eval_adaptive.py
@@ -172,7 +162,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             d = json.load(f)
         data_map[jf.stem] = d
 
-    # Filter to adaptive attack, IID only
     filtered = {k: v for k, v in data_map.items()
                 if v["config"]["attack"] == "adaptive" and v["config"]["partition"] == "iid"}
 
@@ -198,7 +187,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
         f.write(f"- **Poison phase**: rounds {obs_window}–{num_rounds-1} "
                 f"({poison_rounds} rounds of active poisoning)\n\n")
 
-        # Group by (defense, ablation)
         from collections import defaultdict
         grouped = defaultdict(list)
         for name, d in filtered.items():
@@ -206,7 +194,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             key = (cfg["defense"], cfg.get("ablation", ""))
             grouped[key].append(d)
 
-        # --- Accuracy Table ---
         f.write("## Final Accuracy\n\n")
         f.write("| Defense | Ablation | Final Acc | Std | Convergence (90%) |\n")
         f.write("|---------|----------|:---------:|:---:|:-----------------:|\n")
@@ -226,11 +213,10 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             std_acc = statistics.stdev(accs) if len(accs) > 1 else 0.0
             convs = [d["convergence_round_90"] for d in dlist]
             valid_conv = [c for c in convs if c >= 0]
-            conv_str = f"{statistics.mean(valid_conv):.0f}" if valid_conv else "✗"
+            conv_str = f"{statistics.mean(valid_conv):.0f}" if valid_conv else "x"
             abl_str = ablation if ablation else "—"
             f.write(f"| {defense} | {abl_str} | {avg_acc:.4f} | {std_acc:.4f} | {conv_str} |\n")
 
-        # --- Detection Table ---
         f.write("\n## Detection Performance\n\n")
         f.write("| Defense | Ablation | TPR | FPR | F1 | Flagged/Rnd |\n")
         f.write("|---------|----------|:---:|:---:|:--:|:-----------:|\n")
@@ -251,7 +237,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             f.write(f"| {defense} | {abl_str} | {avg_tpr:.3f} | {avg_fpr:.3f} | "
                     f"{avg_f1:.3f} | {avg_flagged:.1f} |\n")
 
-        # --- ZKP Metrics ---
         f.write("\n## ZKP Proof Metrics\n\n")
         f.write("| Trial | ZKP Prove (s) | ZKP Verify (s) | Failed/Rnd | Gen/Rnd |\n")
         f.write("|:-----:|:---:|:---:|:---:|:---:|\n")
@@ -264,7 +249,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             f.write(f"| {i} | {d['avg_zk_prove_time']:.2f} | "
                     f"{d['avg_zk_verify_time']:.2f} | {avg_fail:.1f} | {avg_gen:.1f} |\n")
 
-        # --- Stealth vs Poison phase accuracy ---
         f.write("\n## Accuracy: Stealth Phase vs Poison Phase\n\n")
         f.write("Shows accuracy at end of observation window (round 4) vs final round.\n\n")
         f.write("| Defense | Ablation | Acc @ Rnd 4 (stealth) | Final Acc | Delta |\n")
@@ -284,7 +268,6 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
                     f.write(f"| {defense} | {abl_str} | {acc_stealth:.4f} | "
                             f"{acc_final:.4f} | {delta:+.4f} |\n")
 
-        # --- Timing ---
         f.write("\n## Timing\n\n")
         f.write("| Defense | Ablation | Avg/Rnd (s) | Total (s) |\n")
         f.write("|---------|----------|:-----------:|:---------:|\n")
@@ -298,9 +281,8 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             avg_total = statistics.mean([d["total_time"] for d in dlist])
             f.write(f"| {defense} | {abl_str} | {avg_rnd:.2f} | {avg_total:.1f} |\n")
 
-        # --- Trajectories ---
         f.write("\n## Accuracy Trajectories\n\n")
-        f.write(f"Stealth phase (rounds 0–{obs_window-1}) → "
+        f.write(f"Stealth phase (rounds 0–{obs_window-1}) -> "
                 f"Poison phase (rounds {obs_window}–{num_rounds-1})\n\n")
         f.write("```\n")
         for defense, ablation in defense_order:
@@ -312,14 +294,13 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
                 rounds = d.get("rounds", [])
                 traj_parts = []
                 for i, r in enumerate(rounds):
-                    marker = "•" if i < obs_window else "×"
+                    marker = "•" if i < obs_window else "x"
                     traj_parts.append(f"{r['accuracy']:.3f}{marker}")
-                traj = " → ".join(traj_parts)
+                traj = " -> ".join(traj_parts)
                 f.write(f"{defense}{abl}: {traj}\n")
         f.write("```\n")
-        f.write(f"(• = stealth/honest, × = active poison)\n")
+        f.write(f"(• = stealth/honest, x = active poison)\n")
 
-        # --- Key findings ---
         f.write("\n## Key Findings\n\n")
 
         vanilla = grouped.get(("vanilla", ""), [])
@@ -341,12 +322,12 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             f.write(f"3. **PG-Full (ZKP) vs Krum**: {full_acc:.2%} vs {krum_acc:.2%} "
                     f"({full_acc - krum_acc:+.2%})\n")
             if abs(full_acc - krum_acc) < 0.005:
-                f.write(f"   → ZKP provides **no accuracy benefit** — "
+                f.write(f"   -> ZKP provides **no accuracy benefit** — "
                         f"adaptive poison norms stay within ZKP bounds\n")
             elif full_acc > krum_acc:
-                f.write(f"   → ZKP **catches adaptive poison** that evades Krum!\n")
+                f.write(f"   -> ZKP **catches adaptive poison** that evades Krum!\n")
             else:
-                f.write(f"   → ZKP **worse** — adaptive attack designed to evade norm checks\n")
+                f.write(f"   -> ZKP **worse** — adaptive attack designed to evade norm checks\n")
 
         if pg_full:
             avg_fpr = statistics.mean([d["avg_fpr"] for d in pg_full])
@@ -361,23 +342,23 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
                     avg_fail = statistics.mean([
                         r.get("zk_proofs_failed", 0) for r in poison_rounds_data
                     ])
-                    f.write(f"   → ZKP rejected {avg_fail:.1f}/round during poison phase\n")
+                    f.write(f"   -> ZKP rejected {avg_fail:.1f}/round during poison phase\n")
 
         f.write(f"\n### Adaptive Attack Evasion Analysis\n\n")
         f.write(f"The adaptive attacker crafts gradients with:\n")
-        f.write(f"- Norm within μ ± 2σ of honest gradient norms\n")
+        f.write(f"- Norm within mu +/- 2sigma of honest gradient norms\n")
         f.write(f"- Cosine similarity > 0.3 with honest centroid\n\n")
-        f.write(f"**ZKP**: Uses server-side median + 3×MAD bounds.\n")
-        f.write(f"- If adaptive norm ∈ [μ−2σ, μ+2σ] ⊂ [median−3×MAD, median+3×MAD] → "
-                f"passes ZKP ✗\n")
-        f.write(f"- If adaptive norm exceeds server bounds → caught by ZKP ✓\n\n")
+        f.write(f"**ZKP**: Uses server-side median + 3xMAD bounds.\n")
+        f.write(f"- If adaptive norm ∈ [mu-2sigma, mu+2sigma] ⊂ [median-3xMAD, median+3xMAD] -> "
+                f"passes ZKP x\n")
+        f.write(f"- If adaptive norm exceeds server bounds -> caught by ZKP :)\n\n")
         f.write(f"**Krum**: Uses distance-based selection.\n")
-        f.write(f"- If cosine(poison, centroid) > 0.3 → similar direction → may survive Krum ✗\n")
-        f.write(f"- If attack_strength is high → distance from honest cluster → Krum catches ✓\n")
+        f.write(f"- If cosine(poison, centroid) > 0.3 -> similar direction -> may survive Krum x\n")
+        f.write(f"- If attack_strength is high -> distance from honest cluster -> Krum catches :)\n")
 
         f.write(f"\n---\n*Generated {time.strftime('%Y-%m-%d %H:%M:%S')}*\n")
 
-    print(f"\n✅ Report: {report_path}")
+    print(f"\n Report: {report_path}")
 
 
 def main():
@@ -417,7 +398,7 @@ def main():
           f"{base_config['num_galaxies']} galaxies, "
           f"{args.rounds} rounds, "
           f"{base_config['byzantine_fraction']:.0%} Byzantine")
-    print(f"Adaptive attacker: 5-round observation → {poison_rounds} rounds active poison")
+    print(f"Adaptive attacker: 5-round observation -> {poison_rounds} rounds active poison")
     print(f"Est. time: {total_est/60:.0f} min")
     print(f"Output: {base_config['output_dir']}")
     print(f"{'='*80}\n")
@@ -442,7 +423,7 @@ def main():
             elapsed = time.time() - start_time
             remaining = len(experiments) - i
             eta = (elapsed / i) * remaining if i > 0 else 0
-            print(f"\n⏱️  Progress: {i}/{len(experiments)} ({i/len(experiments):.0%})")
+            print(f"\n  Progress: {i}/{len(experiments)} ({i/len(experiments):.0%})")
             print(f"   Elapsed: {elapsed/60:.1f} min, ETA: {eta/60:.1f} min")
 
     total_elapsed = time.time() - start_time
@@ -453,7 +434,7 @@ def main():
     print(f"Results: {output_path}")
 
     create_summary_report(output_path, experiments, base_config)
-    print(f"\n✅ Done! Check {output_path}/ADAPTIVE_EVAL_RESULTS.md")
+    print(f"\n Done! Check {output_path}/ADAPTIVE_EVAL_RESULTS.md")
 
 
 if __name__ == "__main__":

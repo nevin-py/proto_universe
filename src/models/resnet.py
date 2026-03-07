@@ -1,15 +1,15 @@
-"""ResNet18 adapted for CIFAR-10 (32×32 images).
+"""ResNet18 adapted for CIFAR-10 (32x32 images).
 
 Standard torchvision ResNet18 with two modifications for the smaller
 input resolution:
 
-1. Replace the 7×7 / stride-2 first convolution with a 3×3 / stride-1
+1. Replace the 7x7 / stride-2 first convolution with a 3x3 / stride-1
    convolution (padding 1).
 2. Remove the initial max-pool layer (replaced by ``nn.Identity``).
 
 These changes are standard practice in the CIFAR-10 research literature
 (He et al., 2016; Kuangliu/pytorch-cifar) to avoid excessive spatial
-down-sampling on 32×32 inputs.
+down-sampling on 32x32 inputs.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class CIFAR10ResNet18(nn.Module):
         Number of output classes (default 10 for CIFAR-10).
     pretrained : bool
         Whether to load ImageNet pretrained weights (not recommended
-        for 32×32 images but available for transfer learning experiments).
+        for 32x32 images but available for transfer learning experiments).
     """
 
     def __init__(self, num_classes: int = 10, pretrained: bool = False):
@@ -37,14 +37,14 @@ class CIFAR10ResNet18(nn.Module):
         weights = models.ResNet18_Weights.DEFAULT if pretrained else None
         self.model = models.resnet18(weights=weights)
 
-        # Modify conv1: 7×7/stride-2 → 3×3/stride-1/padding-1
+        # Modify conv1: 7x7/stride-2 -> 3x3/stride-1/padding-1
         self.model.conv1 = nn.Conv2d(
             3, 64,
             kernel_size=3, stride=1, padding=1,
             bias=False,
         )
 
-        # Remove max-pool (32×32 is already small)
+        # Remove max-pool (32x32 is already small)
         self.model.maxpool = nn.Identity()
 
         # Adjust final FC layer for num_classes

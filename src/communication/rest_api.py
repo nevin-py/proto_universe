@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from abc import ABC, abstractmethod
 
-# Note: Flask/FastAPI imports are optional - use try/except for flexibility
 try:
     from flask import Flask, request, jsonify
     FLASK_AVAILABLE = True
@@ -23,9 +22,6 @@ except ImportError:
     FLASK_AVAILABLE = False
 
 
-# ==============================================================================
-# Data Classes for API Messages
-# ==============================================================================
 
 @dataclass
 class GradientSubmission:
@@ -119,10 +115,6 @@ class ModelBroadcast:
         }
 
 
-# ==============================================================================
-# Abstract API Interface
-# ==============================================================================
-
 class CommunicationAPI(ABC):
     """Abstract base class for communication APIs"""
     
@@ -141,10 +133,6 @@ class CommunicationAPI(ABC):
         """Check if server is running"""
         pass
 
-
-# ==============================================================================
-# Galaxy Communication Module (PROTO-306)
-# ==============================================================================
 
 class GalaxyAPIServer(CommunicationAPI):
     """
@@ -325,10 +313,6 @@ class GalaxyAPIClient:
         return response.json()
 
 
-# ==============================================================================
-# Global Communication Hub (PROTO-407)
-# ==============================================================================
-
 class GlobalAPIServer(CommunicationAPI):
     """
     Global aggregator communication hub (PROTO-407).
@@ -504,10 +488,6 @@ class GlobalAPIClient:
         )
         return response.json()
 
-
-# ==============================================================================
-# Utility Functions
-# ==============================================================================
 
 def serialize_gradients(gradients: List) -> List[List[float]]:
     """Serialize gradient tensors to nested lists for JSON"""

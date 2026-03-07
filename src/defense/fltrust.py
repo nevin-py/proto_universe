@@ -39,19 +39,19 @@ class FLTrustAggregator:
     Algorithm (per round)
     ---------------------
     1. Server trains its own copy of the global model on the clean root
-       dataset for ``server_epochs`` epochs → compute server gradient
+       dataset for ``server_epochs`` epochs -> compute server gradient
        update ``g_s``.
     2. For each client update ``g_i``:
        a. ``cos_i = cosine_similarity(flatten(g_i), flatten(g_s))``
        b. ``ts_i  = max(0, cos_i)``          (ReLU clipping)
        c. ``g_i'  = ts_i * (||g_s|| / ||g_i||) * g_i``  (norm-scale to
           server magnitude and weight by trust score)
-    3. ``g_global = Σ g_i' / Σ ts_i``
+    3. ``g_global = sigma g_i' / sigma ts_i``
 
     Parameters
     ----------
     server_dataset : Dataset
-        Small clean dataset (100–1000 samples).
+        Small clean dataset (100-1000 samples).
     server_model : nn.Module
         Copy of the global model; retrained from global weights each round.
     learning_rate : float
@@ -91,10 +91,6 @@ class FLTrustAggregator:
         # Most recent server gradient and trust scores (for diagnostics)
         self._server_gradient: Optional[List[torch.Tensor]] = None
         self._trust_scores: Dict[int, float] = {}
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
 
     def compute_server_update(
         self,
@@ -207,9 +203,6 @@ class FLTrustAggregator:
                 "method": "fltrust",
             }
 
-        # ------------------------------------------------------------------
-        # Per-client trust scoring
-        # ------------------------------------------------------------------
         trust_scores: Dict[int, float] = {}
         client_grads_flat: List[np.ndarray] = []
 
@@ -226,9 +219,6 @@ class FLTrustAggregator:
             ts = max(0.0, cos_sim)
             trust_scores[client_id] = ts
 
-        # ------------------------------------------------------------------
-        # Trust-weighted aggregation with norm normalisation
-        # ------------------------------------------------------------------
         total_ts = sum(trust_scores.values())
         if total_ts < 1e-12:
             logger.warning(
@@ -267,10 +257,6 @@ class FLTrustAggregator:
             "trust_scores": trust_scores,
             "method": "fltrust",
         }
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     def get_trust_scores(self) -> Dict[int, float]:
         """Return trust scores from the most recent aggregation round."""

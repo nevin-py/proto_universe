@@ -116,7 +116,7 @@ class GalaxyManager:
         Returns:
             Dict mapping client_id -> new_galaxy_id for reassigned clients
         """
-        logger.warning(f"🔴 DISSOLVING Galaxy {galaxy_id}")
+        logger.warning(f" DISSOLVING Galaxy {galaxy_id}")
         logger.info(f"  Honest clients: {len(honest_clients)}")
         logger.info(f"  Malicious clients: {len(malicious_clients)} (will be quarantined)")
         
@@ -131,13 +131,13 @@ class GalaxyManager:
             new_galaxy = other_galaxies[idx % len(other_galaxies)]
             self.reassign_client(client_id, new_galaxy, reason="layer5_dissolution")
             reassignments[client_id] = new_galaxy
-            logger.info(f"  ✓ Reassigned honest client {client_id} to galaxy {new_galaxy}")
+            logger.info(f"  :) Reassigned honest client {client_id} to galaxy {new_galaxy}")
         
         # Malicious clients are not reassigned (they're quarantined)
         for client_id in malicious_clients:
             if client_id in self.client_to_galaxy:
                 del self.client_to_galaxy[client_id]
-                logger.info(f"  ✗ Removed malicious client {client_id} from assignments")
+                logger.info(f"  x Removed malicious client {client_id} from assignments")
         
         logger.info(f"Galaxy {galaxy_id} dissolution complete. Reassigned {len(reassignments)} clients.")
         

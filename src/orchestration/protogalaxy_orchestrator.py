@@ -239,8 +239,8 @@ class ProtoGalaxyOrchestrator:
         global_root = global_tree.get_root()
         self.global_merkle_tree = global_tree
         
-        logger.info(f"✓ Global Merkle root: {global_root[:16]}...")
-        logger.info(f"✓ Phase 1 complete: {len(galaxy_roots)} galaxy trees built")
+        logger.info(f":) Global Merkle root: {global_root[:16]}...")
+        logger.info(f":) Phase 1 complete: {len(galaxy_roots)} galaxy trees built")
         
         # --- ZK Sum-Check Proof Generation ---
         zk_proofs_generated = 0
@@ -260,7 +260,7 @@ class ProtoGalaxyOrchestrator:
                 zk_total_time_ms += zk_proof.prove_time_ms
             
             mode = "REAL (ProtoGalaxy IVC)" if self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK (SHA-256)"
-            logger.info(f"✓ ZK proofs: {zk_proofs_generated} generated [{mode}]")
+            logger.info(f":) ZK proofs: {zk_proofs_generated} generated [{mode}]")
             logger.info(f"  Total prove time: {zk_total_time_ms:.1f}ms ({zk_total_time_ms/max(zk_proofs_generated,1):.1f}ms/client)")
         else:
             logger.info("  (No client gradients provided — ZK proofs skipped)")
@@ -339,7 +339,7 @@ class ProtoGalaxyOrchestrator:
                 verified_updates[client_id] = update
                 verification_results[client_id] = True
             else:
-                logger.warning(f"✗ Client {client_id}: INVALID Merkle proof")
+                logger.warning(f"x Client {client_id}: INVALID Merkle proof")
                 rejected_clients.append(client_id)
                 verification_results[client_id] = False
                 
@@ -383,7 +383,7 @@ class ProtoGalaxyOrchestrator:
                 else:
                     zk_failed += 1
                     zk_invalid_clients.append(client_id)
-                    logger.warning(f"  ✗ Client {client_id}: INVALID ZK sum-check proof")
+                    logger.warning(f"  x Client {client_id}: INVALID ZK sum-check proof")
             
             # Remove ZK-invalid clients from verified set
             for cid in zk_invalid_clients:
@@ -393,11 +393,11 @@ class ProtoGalaxyOrchestrator:
             
             zk_verify_time_ms = (_time.time() - zk_start) * 1000
             mode = "REAL" if next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK"
-            logger.info(f"✓ ZK verification [{mode}]: {zk_verified} valid, {zk_failed} invalid ({zk_verify_time_ms:.1f}ms)")
+            logger.info(f":) ZK verification [{mode}]: {zk_verified} valid, {zk_failed} invalid ({zk_verify_time_ms:.1f}ms)")
         
-        logger.info(f"✓ Verified: {len(verified_updates)}/{len(client_updates)} clients ({acceptance_rate:.1%})")
+        logger.info(f":) Verified: {len(verified_updates)}/{len(client_updates)} clients ({acceptance_rate:.1%})")
         if rejected_clients:
-            logger.warning(f"✗ Rejected: {len(rejected_clients)} clients (invalid proofs)")
+            logger.warning(f"x Rejected: {len(rejected_clients)} clients (invalid proofs)")
         
         return PhaseResult(
             phase_name="revelation",
@@ -497,7 +497,7 @@ class ProtoGalaxyOrchestrator:
             if gid in layer5_result['verdicted_clean_galaxies']
         }
         
-        logger.info(f"✓ Clean galaxies: {len(clean_galaxy_updates)}/{len(galaxy_updates)}")
+        logger.info(f":) Clean galaxies: {len(clean_galaxy_updates)}/{len(galaxy_updates)}")
         
         return PhaseResult(
             phase_name="defense",
@@ -556,7 +556,7 @@ class ProtoGalaxyOrchestrator:
                 p.data.copy_(param_vector[offset:offset+numel].view_as(p))
                 offset += numel
         
-        logger.info(f"✓ Global model updated with learning rate {learning_rate}")
+        logger.info(f":) Global model updated with learning rate {learning_rate}")
         
         # --- Galaxy Proof Folding ---
         self.galaxy_zk_proofs = {}
@@ -583,7 +583,7 @@ class ProtoGalaxyOrchestrator:
             
             folding_time_ms = (_time.time() - fold_start) * 1000
             mode = "REAL" if self.galaxy_zk_proofs and next(iter(self.galaxy_zk_proofs.values())).is_real else "FALLBACK"
-            logger.info(f"✓ Galaxy proofs folded [{mode}]: {len(self.galaxy_zk_proofs)} galaxies ({folding_time_ms:.1f}ms)")
+            logger.info(f":) Galaxy proofs folded [{mode}]: {len(self.galaxy_zk_proofs)} galaxies ({folding_time_ms:.1f}ms)")
         
         return PhaseResult(
             phase_name="aggregation",
@@ -635,5 +635,5 @@ class ProtoGalaxyOrchestrator:
         logger.info(f"Phase 4 (Aggregation):   {metrics.get('aggregation_aggregated_galaxies', 0)} galaxies, "
                    f"update norm: {metrics.get('aggregation_update_norm', 0):.4f}")
         
-        logger.info(f"\nRound Status: {'✓ SUCCESS' if round_result['success'] else '✗ FAILED'}")
+        logger.info(f"\nRound Status: {':) SUCCESS' if round_result['success'] else 'x FAILED'}")
         logger.info("="*100 + "\n")

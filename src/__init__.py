@@ -1,6 +1,6 @@
-"""ProtoGalaxy: Hierarchical Federated Learning with Byzantine Defense.
+"""FiZk: Hierarchical Federated Learning with Byzantine Defense.
 
-This package provides a complete implementation of the ProtoGalaxy
+This package provides a complete implementation of the FiZk
 federated learning framework with:
 
 - Hierarchical aggregation (clients -> galaxies -> global)
@@ -22,5 +22,5 @@ Main modules:
 - storage: Model and metrics persistence
 """
 
-__version__ = "0.1.0"
-__author__ = "ProtoGalaxy Team"
+__version__ = "1.0.3"
+__author__ = "FiZk Team"

@@ -5,16 +5,6 @@ training samples and reassigns their label to a chosen target class.
 This enables authentic evaluation of data-level backdoor attacks in
 federated learning settings.
 
-Usage
------
->>> from src.data.backdoor import BackdoorDataset
->>> from src.data.datasets import load_mnist
->>> train_ds, _ = load_mnist()
->>> trigger = torch.ones(1, 5, 5) * 2.5      # white 5×5 patch
->>> bd = BackdoorDataset(train_ds, trigger, trigger_position=(0, 0),
-...                      target_class=0, poisoning_rate=0.1)
->>> img, label = bd[0]                        # may have trigger injected
-
 The trigger is applied *after* the base dataset's transform pipeline,
 so it operates on the normalised tensor representation.  If the base
 transform includes normalisation, the trigger values should be chosen
@@ -113,10 +103,6 @@ class BackdoorDataset(Dataset):
 
         return image, label
 
-    # ------------------------------------------------------------------
-    # Trigger injection
-    # ------------------------------------------------------------------
-
     def _apply_trigger(self, image: torch.Tensor) -> torch.Tensor:
         """Stamp the trigger onto a copy of the image tensor.
 
@@ -143,7 +129,7 @@ class BackdoorDataset(Dataset):
 
         if h_actual <= 0 or w_actual <= 0:
             logger.warning(
-                "Trigger position (%d, %d) is outside the image (%d×%d); "
+                "Trigger position (%d, %d) is outside the image (%dx%d); "
                 "no trigger applied.",
                 row, col, h_img, w_img,
             )
@@ -238,10 +224,6 @@ class BackdoorDataset(Dataset):
                 if (r + c) % 2 == 0:
                     trigger[:, r, c] = intensity
         return trigger
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     @property
     def num_poisoned(self) -> int:

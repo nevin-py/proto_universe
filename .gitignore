@@ -11,6 +11,7 @@ Makefile
 # Distribution / packaging
 .Python
 build/
+.pytest_cache/
 develop-eggs/
 dist/
 downloads/
@@ -44,9 +45,9 @@ env/
 *~
 
 # Data and outputs
-data/mnist/
-data/partitions/
+data/
 outputs/
+config.yaml
 experiments/results/
 
 # OS

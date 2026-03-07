@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Small-Scale ProtoGalaxy Evaluation — Gaussian Noise & Targeted Label Flip (IID only)
+Small-Scale FiZK Evaluation — Gaussian Noise & Targeted Label Flip (IID only)
 =====================================================================================
 
 Runs the same evaluation matrix as run_small_eval.py but for:
@@ -17,7 +17,7 @@ Configuration:
   • Defenses: vanilla, multi_krum, protogalaxy_full (merkle_only, zk_merkle)
 
 Estimated Time:
-  2 attacks × 4 defense configs × 1 trial = 8 experiments
+  2 attacks x 4 defense configs x 1 trial = 8 experiments
   = 2 vanilla (~40s) + 2 multi_krum (~40s) + 2 merkle_only (~50s) + 2 zk_merkle (~200s)
   ≈ 12 min total
 
@@ -252,13 +252,13 @@ def create_summary_report(output_dir: Path, experiments: List[ExperimentConfig],
             abl = f"+{ablation}" if ablation else ""
             for d in dlist:
                 rounds = d.get("rounds", [])
-                traj = " → ".join(f"{r['accuracy']:.3f}" for r in rounds)
+                traj = " -> ".join(f"{r['accuracy']:.3f}" for r in rounds)
                 f.write(f"{defense}{abl} | {attack}: {traj}\n")
         f.write("```\n")
 
         f.write(f"\n---\n*Generated {time.strftime('%Y-%m-%d %H:%M:%S')}*\n")
 
-    print(f"\n✅ Report: {report_path}")
+    print(f"\n Report: {report_path}")
 
 
 def main():
@@ -320,7 +320,7 @@ def main():
             elapsed = time.time() - start_time
             remaining = len(experiments) - i
             eta = (elapsed / i) * remaining if i > 0 else 0
-            print(f"\n⏱️  Progress: {i}/{len(experiments)} ({i/len(experiments):.0%})")
+            print(f"\n  Progress: {i}/{len(experiments)} ({i/len(experiments):.0%})")
             print(f"   Elapsed: {elapsed/60:.1f} min, ETA: {eta/60:.1f} min")
 
     total_elapsed = time.time() - start_time
@@ -331,7 +331,7 @@ def main():
     print(f"Results: {output_path}")
 
     create_summary_report(output_path, experiments, base_config)
-    print(f"\n✅ Done! Check {output_path}/EXTRA_EVAL_RESULTS.md")
+    print(f"\n Done! Check {output_path}/EXTRA_EVAL_RESULTS.md")
 
 
 if __name__ == "__main__":

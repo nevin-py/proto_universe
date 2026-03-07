@@ -12,7 +12,7 @@ Strategy
    similarities, plus the honest centroid direction.
 2. **Poisoning phase** (subsequent rounds):  Craft a gradient that
    maximally moves the model toward the attack goal subject to:
-   -  ``||g_poison|| ∈ [μ_norm - 2σ, μ_norm + 2σ]``
+   -  ``||g_poison|| ∈ [mu_norm - 2sigma, mu_norm + 2sigma]``
    -  ``cosine(g_poison, centroid) > cos_threshold``
 
 This makes the poisoned gradient look statistically indistinguishable
@@ -56,7 +56,7 @@ class AdaptiveAttacker:
         poisoned gradient must maintain (default 0.3).
     attack_strength : float
         Scaling factor applied to the adversarial perturbation
-        component before projection (higher → more aggressive but
+        component before projection (higher -> more aggressive but
         harder to stay within bounds).
     """
 
@@ -86,9 +86,6 @@ class AdaptiveAttacker:
         # Guard against multiple observe calls per round
         self._observed_this_round: bool = False
 
-    # ------------------------------------------------------------------
-    # Observation
-    # ------------------------------------------------------------------
 
     def observe_round(self, honest_gradients: List[List[torch.Tensor]]) -> None:
         """Record statistics of honest gradients for threshold estimation.
@@ -140,9 +137,6 @@ class AdaptiveAttacker:
         """Whether enough rounds have been observed to start adapting."""
         return self._round_count >= self.observation_window
 
-    # ------------------------------------------------------------------
-    # Poison generation
-    # ------------------------------------------------------------------
 
     def generate_adaptive_poison(
         self,
@@ -159,7 +153,7 @@ class AdaptiveAttacker:
            - *targeted*:   ``d = -c + bias toward target_class`` (if possible)
         3. Blend: ``g = α·c + (1 - α)·d``  choosing α so that
            ``cosine(g, c) ≥ cos_threshold``.
-        4. Scale ``g`` so that ``||g|| ∈ [μ - kσ, μ + kσ]``.
+        4. Scale ``g`` so that ``||g|| ∈ [mu - ksigma, mu + ksigma]``.
 
         Parameters
         ----------
@@ -220,9 +214,6 @@ class AdaptiveAttacker:
 
         centroid_unit = centroid / cent_norm
 
-        # ------------------------------------------------------------------
-        # Adversarial direction
-        # ------------------------------------------------------------------
         # Generate a random orthogonal component (Gram-Schmidt)
         rng = np.random.RandomState(self._round_count)
         rand_component = rng.randn(len(centroid_unit)).astype(np.float32)
@@ -233,11 +224,6 @@ class AdaptiveAttacker:
             orth = orth / orth_norm
 
         if attack_goal == "untargeted":
-            # Strategy: move model in a mostly-orthogonal direction that
-            # corrupts decision boundaries while maintaining positive
-            # cosine with centroid.  Pure -c is useless because the
-            # cosine constraint forces the blend back to ~+c.
-            # Instead: 90% orthogonal + 10% anti-centroid
             adv_direction = 0.95 * orth - 0.31 * centroid_unit
             adv_norm = float(np.linalg.norm(adv_direction))
             if adv_norm > 1e-12:
@@ -252,13 +238,6 @@ class AdaptiveAttacker:
         else:
             raise ValueError(f"Unknown attack_goal: {attack_goal}")
 
-        # ------------------------------------------------------------------
-        # Blend centroid and adversarial to meet cosine threshold
-        # ------------------------------------------------------------------
-        # g = α·centroid_unit + (1-α)·attack_strength·adv_direction
-        # We want cosine(g, centroid_unit) ≥ cos_threshold.
-        # cosine ≈ α / ||g||  (if adv_direction ⊥ centroid_unit it's exact)
-        # Binary search for the largest attack contribution that meets threshold.
         alpha_lo, alpha_hi = 0.0, 1.0
         best_alpha = 1.0  # default: pure centroid (safe)
         for _ in range(30):
@@ -278,11 +257,8 @@ class AdaptiveAttacker:
         # Construct the poisoned gradient with best alpha
         poisoned_flat = best_alpha * centroid_unit + (1.0 - best_alpha) * self.attack_strength * adv_direction
 
-        # ------------------------------------------------------------------
-        # Scale to match honest norm statistics
-        # ------------------------------------------------------------------
         target_norm = self._mean_norm + 0.5 * self._std_norm  # slightly above mean
-        # Clamp to [μ - kσ, μ + kσ]
+        # Clamp to [mu - ksigma, mu + ksigma]
         norm_lo = max(0.01, self._mean_norm - self.norm_sigma_bound * self._std_norm)
         norm_hi = self._mean_norm + self.norm_sigma_bound * self._std_norm
         target_norm = float(np.clip(target_norm, norm_lo, norm_hi))
@@ -315,9 +291,6 @@ class AdaptiveAttacker:
 
         return result
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     def get_statistics(self) -> Dict[str, float]:
         """Return the currently estimated honest-gradient statistics."""

@@ -1,5 +1,5 @@
 """
-ProtoGalaxy Full Pipeline Runner
+FiZK Full Pipeline Runner
 =================================
 Runs the complete 4-phase federated learning pipeline end-to-end:
   Phase 1: Commitment  — clients commit gradients via CommitmentGenerator
@@ -35,11 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.models.mnist import create_mnist_model
 from src.client.trainer import Trainer
-from src.orchestration.pipeline import ProtoGalaxyPipeline
+from src.orchestration.pipeline import FiZKPipeline
 from src.crypto.merkle import verify_proof as merkle_verify_proof
 
 
-# ─── Utilities ────────────────────────────────────────────────────────────────
 
 def load_mnist(data_dir="./data"):
     """Download and load MNIST dataset."""
@@ -153,7 +152,6 @@ def evaluate_model(model, test_loader, device="cpu"):
     return correct / total if total > 0 else 0.0
 
 
-# ─── Evaluation Metrics (Architecture Section 6.4) ───────────────────────────
 
 class MetricsTracker:
     """Tracks all evaluation metrics from Architecture Section 6.4."""
@@ -209,10 +207,9 @@ class MetricsTracker:
         }
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="ProtoGalaxy Full Pipeline")
+    parser = argparse.ArgumentParser(description="FiZK Full Pipeline")
     parser.add_argument("--num-clients", type=int, default=8)
     parser.add_argument("--num-galaxies", type=int, default=2)
     parser.add_argument("--num-rounds", type=int, default=3)
@@ -242,7 +239,7 @@ def main():
     torch.manual_seed(42)
 
     print("=" * 70)
-    print("   ProtoGalaxy Full Pipeline — End-to-End Run")
+    print("   FiZK Full Pipeline — End-to-End Run")
     print("=" * 70)
     print(f"  Clients: {args.num_clients}  |  Galaxies: {args.num_galaxies}  |  "
           f"Rounds: {args.num_rounds}  |  Model: {args.model_type}")
@@ -252,11 +249,10 @@ def main():
     num_byzantine = int(args.num_clients * args.byzantine_fraction)
     byzantine_ids = set(range(num_byzantine))
     if num_byzantine > 0:
-        print(f"  ⚠️  Byzantine: {num_byzantine} clients ({args.attack_type})  "
+        print(f"    Byzantine: {num_byzantine} clients ({args.attack_type})  "
               f"IDs: {sorted(byzantine_ids)}")
     print("=" * 70)
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
     print(f"\n📦 Loading {args.dataset.upper()} dataset...")
     if args.dataset == "cifar10":
         train_dataset, test_dataset = load_cifar10()
@@ -275,35 +271,32 @@ def main():
     else:
         client_data = iid_partition(train_dataset, args.num_clients)
         print(f"   IID partition")
-    print(f"   {len(train_dataset)} train samples → ~{len(client_data[0])} per client")
+    print(f"   {len(train_dataset)} train samples -> ~{len(client_data[0])} per client")
 
-    # ── 2. Create global model ────────────────────────────────────────────────
     global_model = create_mnist_model(args.model_type)
     initial_acc = evaluate_model(global_model, test_loader)
     print(f"\n🧠 Global model ({args.model_type}): "
           f"{sum(p.numel() for p in global_model.parameters())} params")
     print(f"   Initial accuracy: {initial_acc:.2%}")
 
-    # ── 3. Create pipeline ────────────────────────────────────────────────────
     defense_config = {
         'layer3_trim_ratio': args.trim_ratio,
         'layer3_method': args.aggregation_method,
     }
-    pipeline = ProtoGalaxyPipeline(
+    pipeline = FiZKPipeline(
         global_model=global_model,
         num_clients=args.num_clients,
         num_galaxies=args.num_galaxies,
         defense_config=defense_config,
         logger=None,
     )
-    print(f"\n🚀 Pipeline initialized")
+    print(f"\n Pipeline initialized")
     print(f"   Galaxy assignments: "
           f"{ {g: len(c) for g, c in pipeline.galaxy_assignments.items()} }")
 
     metrics = MetricsTracker(byzantine_ids=byzantine_ids,
                              num_clients=args.num_clients)
 
-    # ── 4. Run rounds ─────────────────────────────────────────────────────────
     for round_num in range(args.num_rounds):
         round_start = time.time()
         pipeline.current_round = round_num
@@ -324,7 +317,7 @@ def main():
             client_trainers[cid] = trainer
 
         # PHASE 1: COMMITMENT
-        print(f"  📝 Phase 1: Commitment...")
+        print(f"   Phase 1: Commitment...")
         client_grads = {}
         commitments_by_galaxy = {}
         client_metadata = {}
@@ -401,7 +394,7 @@ def main():
                         merkle_ok += 1
                     else:
                         merkle_fail += 1
-                        print(f"     ⚠️  Client {cid} Merkle verification FAILED")
+                        print(f"       Client {cid} Merkle verification FAILED")
                 else:
                     merkle_fail += 1
         print(f"     🔒 Client Merkle verification: "
@@ -428,7 +421,7 @@ def main():
             total_verified += len(verified)
             total_rejected += len(rejected)
 
-        print(f"     ✅ Verified: {total_verified}  ❌ Rejected: {total_rejected}")
+        print(f"      Verified: {total_verified}  ❌ Rejected: {total_rejected}")
 
         # ZK sum-check proof verification (Architecture §4.1)
         all_verified_ids = [
@@ -453,10 +446,10 @@ def main():
                 ]
             total_verified -= len(zk_reject_set)
             total_rejected += len(zk_reject_set)
-            print(f"     ⚠️  ZK rejected: {sorted(zk_reject_set)}")
+            print(f"       ZK rejected: {sorted(zk_reject_set)}")
 
         # PHASE 3: DEFENSE
-        print(f"  🛡️  Phase 3: Multi-layer defense...")
+        print(f"    Phase 3: Multi-layer defense...")
         galaxy_agg_grads = {}
         galaxy_defense_reports = {}
         round_flagged_clients: set = set()
@@ -517,7 +510,7 @@ def main():
             if reps:
                 rep_str = ', '.join(
                     f'G{k}={v:.3f}' for k, v in sorted(reps.items()))
-                print(f"     📈 Galaxy reputations: {rep_str}")
+                print(f"      Galaxy reputations: {rep_str}")
 
         pipeline.phase4_update_global_model(global_grads)
 
@@ -538,7 +531,6 @@ def main():
 
         sync_package = pipeline.phase4_distribute_model()
 
-        # ROUND SUMMARY + METRICS
         round_time = time.time() - round_start
         accuracy = evaluate_model(global_model, test_loader)
 
@@ -554,7 +546,7 @@ def main():
         )
 
         rm = metrics.round_metrics[-1]
-        print(f"\n  📊 Round {round_num} summary:")
+        print(f"\n   Round {round_num} summary:")
         print(f"     Accuracy: {accuracy:.2%}")
         print(f"     Model hash: {sync_package['model_hash'][:16]}...")
         print(f"     Duration: {round_time:.2f}s")
@@ -563,7 +555,6 @@ def main():
                   f"FPR: {rm['fpr']:.2%}")
             print(f"     Flagged clients: {rm['flagged']}")
 
-    # ── Final ─────────────────────────────────────────────────────────────────
     final_acc = evaluate_model(global_model, test_loader)
     summary = metrics.summary()
     print(f"\n{'=' * 70}")
