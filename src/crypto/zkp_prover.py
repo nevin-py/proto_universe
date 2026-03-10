@@ -97,50 +97,62 @@ class GradientSumCheckProver:
         round_number: int,
         norm_thresholds: Optional[List[float]] = None,
     ) -> ZKProof:
-        """Generate a ZK proof that gradient sums are correctly computed.
+        """Generate a ZK proof that per-layer gradient L2 norms are within bounds.
+
+        What the circuit proves per layer:
+          1. z_{i+1} = z_i + l2_norm_i   (IVC accumulation of total gradient magnitude)
+          2. l2_norm_i² ≤ max_norm_i²    (real 64-bit range proof, not a tautology)
+
+        Using L2 norms (not gradient sums) means:
+          - Model-poisoning (10× scaled gradients) → 10× L2 norm → exceeds bound → proof fails
+          - Gaussian noise → proportional norm increase → caught above threshold
+          - Gradient sums cancel for large layers (CLT) so sum-based checks are ineffective
 
         Args:
             gradients: List of gradient tensors (one per model layer)
             client_id: Client identifier
             round_number: FL round number
-            norm_thresholds: Optional per-layer norm bounds. If None, computed automatically.
+            norm_thresholds: Per-layer norm bounds (from server). If None, computed from
+                             the client's own gradients (weaker — only used without bounds).
 
         Returns:
-            ZKProof with proof bytes, metadata, and norm bounds
+            ZKProof whose layer_sums field contains the per-layer L2 norms
+            (the IVC state accumulates total gradient magnitude, not element sums).
         """
         start = time.time()
 
-        # Compute per-layer sums
-        layer_sums = [g.sum().item() for g in gradients]
-        total_sum = sum(layer_sums)
-        
-        # Compute norm bounds if not provided
+        # Use per-layer L2 norms as the circuit input (not element sums).
+        # Sums cancel for large layers (e.g., 7840-element weight matrices);
+        # L2 norms scale proportionally with attack magnitude.
+        layer_norms = [torch.norm(g).item() for g in gradients]
+        total_norm  = sum(layer_norms)
+
         if norm_thresholds is None and self._use_bounds:
             norm_thresholds = self._compute_norm_thresholds(gradients)
         elif norm_thresholds is None:
             norm_thresholds = []
 
         if self._use_bounds and norm_thresholds:
-            proof_bytes, num_steps = self._prove_real_bounded(layer_sums, norm_thresholds)
+            proof_bytes, num_steps = self._prove_real_bounded(layer_norms, norm_thresholds)
             bounds_enforced = True
         elif self._is_real:
-            proof_bytes, num_steps = self._prove_real(layer_sums)
+            proof_bytes, num_steps = self._prove_real(layer_norms)
             bounds_enforced = False
         else:
-            proof_bytes, num_steps = self._prove_fallback(layer_sums)
+            proof_bytes, num_steps = self._prove_fallback(layer_norms)
             bounds_enforced = False
 
         elapsed_ms = (time.time() - start) * 1000
 
         return ZKProof(
             proof_bytes=proof_bytes,
-            claimed_sum=total_sum,
+            claimed_sum=total_norm,           # IVC state = total L2 magnitude
             num_steps=num_steps,
             client_id=client_id,
             round_number=round_number,
             prove_time_ms=elapsed_ms,
             is_real=self._is_real,
-            layer_sums=layer_sums,
+            layer_sums=layer_norms,           # field name kept for compatibility
             norm_bounds=norm_thresholds if norm_thresholds else [],
             bounds_enforced=bounds_enforced,
         )

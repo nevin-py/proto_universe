@@ -59,7 +59,7 @@ class DefenseCoordinator:
         self.config = {
             'layer1_threshold': config.get('layer1_threshold', 3.0),
             'layer2_threshold': config.get('layer2_threshold', 3.0),
-            'layer3_method': config.get('layer3_method', self.AGGREGATOR_TRIMMED_MEAN),
+            'layer3_method': config.get('layer3_method', self.AGGREGATOR_MULTI_KRUM),
             'layer3_trim_ratio': config.get('layer3_trim_ratio', 0.1),
             'layer3_krum_f': config.get('layer3_krum_f', 1),
             'layer3_krum_m': config.get('layer3_krum_m', 1),

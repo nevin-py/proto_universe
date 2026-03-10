@@ -34,7 +34,8 @@ class StatisticalAnalyzer:
     3. Coordinate-wise analysis - flags gradients with outlier coordinates
     4. Distribution shift - flags gradients with high KL-divergence from aggregate
     
-    A gradient is flagged as anomalous if it fails ≥2 of the 4 metrics.
+    A gradient is flagged as anomalous if it fails ≥3 of the 4 metrics.
+    (Requiring 2 causes false positives in small galaxies during late convergence.)
     """
     
     def __init__(
@@ -43,7 +44,7 @@ class StatisticalAnalyzer:
         cosine_threshold: float = 0.5,
         coordinate_threshold_sigma: float = 3.0,
         kl_divergence_threshold: float = 2.0,
-        min_failures_to_flag: int = 2
+        min_failures_to_flag: int = 3
     ):
         """
         Initialize statistical analyzer.
@@ -53,7 +54,12 @@ class StatisticalAnalyzer:
             cosine_threshold: Minimum cosine similarity to mean gradient
             coordinate_threshold_sigma: Number of std devs for coordinate-wise outliers
             kl_divergence_threshold: Max KL-divergence from aggregate distribution
-            min_failures_to_flag: Minimum number of failed metrics to flag as anomaly
+            min_failures_to_flag: Minimum number of failed metrics to flag as anomaly.
+                Default 3 (out of 4) — requires simultaneous failure of 3 independent
+                metrics.  With 5 clients per galaxy, setting this to 2 causes honest
+                clients to be sporadically flagged due to small-sample instability in
+                late convergence rounds when gradient norms are near zero.
+                Malicious clients (10× scale) fail all 4 metrics, so 3 is still effective.
         """
         self.norm_threshold_sigma = norm_threshold_sigma
         self.cosine_threshold = cosine_threshold

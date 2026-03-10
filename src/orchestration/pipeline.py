@@ -316,17 +316,25 @@ class ProtoGalaxyPipeline:
     def _compute_global_norm_bounds(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
+        min_relative_margin: float = 5.0,
     ) -> List[float]:
         """Compute server-side norm bounds from all clients using robust statistics.
 
-        For each layer, the bound is: median(L2_norm) + k * MAD(L2_norm)
-        where k = norm_scale_factor (default 3.0).
+        For each layer, the bound is:
+            median(L2_norm) + max(k * MAD(L2_norm), min_relative_margin * median)
 
-        Uses L2 norms — NOT scalar sums — because gradient values tend to
-        cancel out in large tensors, making sums ≈ 0 for both honest and
-        malicious clients.  L2 norms scale proportionally with attack
-        magnitude (e.g. 10x scaling -> 10x norm).
+        The ``min_relative_margin`` floor prevents false positives when honest
+        clients have similar norms (small MAD) — the bound is at least
+        ``(1 + min_relative_margin) × median``.  With 5.0 the bound is 6× median:
 
+          - IID: honest norm variance stays within ~4× median even in late rounds
+            when small gradients create high relative variance.
+          - Non-IID Dirichlet (α=0.1/0.5): natural spread ~3-4× median.
+          - Attack (10× scale): malicious norms are ~10× median → above 6× → caught.
+
+        Uses L2 norms — NOT scalar sums — because gradient values cancel out
+        in large tensors, making sums ≈ 0 for both honest and malicious clients.
+        L2 norms scale proportionally with attack magnitude (10× scale → 10× norm).
         This prevents malicious clients from setting their own bounds.
         """
         num_layers = len(next(iter(client_gradients.values())))
@@ -342,9 +350,69 @@ class ProtoGalaxyPipeline:
             t = torch.tensor(layer_vals)
             median = t.median().item()
             mad = (t - median).abs().median().item()
-            bound = median + k * max(mad, 1e-6)
+            # Use the larger of MAD-based and relative-margin-based bounds
+            # to avoid false positives when honest norms are tightly clustered
+            mad_margin = k * max(mad, 1e-6)
+            rel_margin = min_relative_margin * max(abs(median), 1e-6)
+            bound = median + max(mad_margin, rel_margin)
             bounds.append(max(bound, 1e-6))
         return bounds
+
+    def phase1_apply_norm_filter_only(
+        self,
+        client_gradients: Dict[int, List[torch.Tensor]],
+        round_number: int,
+    ) -> Dict[str, Any]:
+        """FiZK-Norm ablation: apply robust norm bounds WITHOUT generating ZKP proofs.
+
+        Identical rejection logic to ``phase1_generate_zk_proofs`` — same
+        ``_compute_global_norm_bounds`` formula — but skips all Rust/Sonobe
+        proof generation.  This isolates the accuracy contribution of the norm
+        bound from the cryptographic verifiability added by the ZKP.
+
+        Rejected client IDs are stored in ``self.norm_filter_rejected_ids`` so
+        the caller can feed them into the same ``round_flagged`` tracking used
+        for ZKP rejections.
+
+        Args:
+            client_gradients: Dict mapping client_id -> List[torch.Tensor]
+            round_number: Current FL round (used for logging only)
+
+        Returns:
+            Dict with keys: accepted, rejected, rejected_ids, norm_bounds
+        """
+        self.norm_filter_rejected_ids: List[int] = []
+        self.global_norm_bounds = self._compute_global_norm_bounds(client_gradients)
+
+        if self.logger:
+            self.logger.logger.debug(
+                f"[FiZK-Norm] Round {round_number}: bounds (median+5×MAD): "
+                f"{[f'{b:.4f}' for b in self.global_norm_bounds]}"
+            )
+
+        accepted: Dict[int, List[torch.Tensor]] = {}
+        for client_id, grads in client_gradients.items():
+            violation = False
+            for li, g in enumerate(grads):
+                if torch.norm(g).item() > self.global_norm_bounds[li]:
+                    violation = True
+                    break
+            if violation:
+                self.norm_filter_rejected_ids.append(client_id)
+                if self.logger:
+                    self.logger.logger.info(
+                        f"  [FiZK-Norm] Client {client_id}: x REJECTED — norm violation"
+                    )
+            else:
+                accepted[client_id] = grads
+
+        return {
+            "accepted": len(accepted),
+            "rejected": len(self.norm_filter_rejected_ids),
+            "rejected_ids": list(self.norm_filter_rejected_ids),
+            "norm_bounds": self.global_norm_bounds,
+            "accepted_grads": accepted,
+        }
 
     def phase1_generate_zk_proofs(
         self,
@@ -387,42 +455,27 @@ class ProtoGalaxyPipeline:
             self.global_norm_bounds = None
         
         for client_id, grads in client_gradients.items():
-            # ----- Server-side L2 norm check (before ZKP proving) -----
-            # This catches malicious clients whose gradient norms exceed
-            # the robust bounds.  The ZKP circuit checks scalar sums
-            # (which cancel out), so we need this explicit norm check.
-            if self.global_norm_bounds:
-                violation_layers = []
-                for li, g in enumerate(grads):
-                    client_norm = torch.norm(g).item()
-                    if client_norm > self.global_norm_bounds[li]:
-                        violation_layers.append(
-                            f"L{li}({client_norm:.2f}>{self.global_norm_bounds[li]:.2f})"
-                        )
-                
-                if violation_layers:
-                    zk_bound_failures += 1
-                    if self.logger:
-                        self.logger.logger.info(
-                            f"  Client {client_id}: x REJECTED — norm violations [{', '.join(violation_layers)}]"
-                        )
-                    continue  # Skip proof generation — client rejected
-
+            # Pass norm bounds to ZKP prover — the circuit enforces them via
+            # a real 64-bit range proof.  There is NO Python pre-check here so
+            # that the circuit is the genuine enforcer.  If a Byzantine client's
+            # gradient norms exceed the bounds, prove_gradient_sum → Rust
+            # prove_gradient_step returns a SynthesisError and no valid proof
+            # is generated.  phase2_verify_zk_proofs then records zk_failed.
             try:
                 zk_proof = self.zkp_prover.prove_gradient_sum(
                     gradients=grads,
                     client_id=client_id,
                     round_number=round_number,
-                    norm_thresholds=None,  # Norms already checked above
+                    norm_thresholds=self.global_norm_bounds,  # circuit enforces
                 )
                 self.client_zk_proofs[client_id] = zk_proof
                 zk_total_time_ms += zk_proof.prove_time_ms
             except Exception as e:
-                # Malicious client's gradients exceed bounds
                 zk_bound_failures += 1
                 if self.logger:
-                    self.logger.logger.warning(
-                        f"ZKP proof generation FAILED for client {client_id}: {e}"
+                    self.logger.logger.info(
+                        f"  Client {client_id}: x REJECTED — ZK circuit range proof failed "
+                        f"(Byzantine gradient norm exceeds bound): {e}"
                     )
         
         num_proofs = len(self.client_zk_proofs)

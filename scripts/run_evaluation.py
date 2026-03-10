@@ -154,7 +154,7 @@ except ImportError as e:
     ZKP_PERF_AVAILABLE = False
     ATTACK_REJECTION_AVAILABLE = False
 
-SUPPORTED_DEFENSES = ("vanilla", "multi_krum", "fltrust", "protogalaxy_full")
+SUPPORTED_DEFENSES = ("vanilla", "multi_krum", "fltrust", "protogalaxy_full", "fizk_norm")
 SUPPORTED_ATTACKS = (
     "none",
     "label_flip",
@@ -164,6 +164,8 @@ SUPPORTED_ATTACKS = (
     "gaussian_noise",
     "adaptive",
     "sybil",
+    "gradient_substitution",   # Byzantine commits honest grads, submits poisoned in phase2
+    "compromised_aggregator",  # Server silently accepts 1 norm-violating Byzantine client
 )
 SUPPORTED_PARTITIONS = ("iid", "noniid", "dirichlet")
 ABLATION_MODES = ("merkle_only", "zk_merkle")
@@ -272,7 +274,7 @@ class ExperimentConfig:
 
     # Defense
     defense: str = "protogalaxy_full"
-    aggregation_method: str = "trimmed_mean"
+    aggregation_method: str = "multi_krum"
     trim_ratio: float = 0.1
     ablation: str = ""  # "" | "merkle_only" | "zk_merkle"
 
@@ -292,6 +294,8 @@ class ExperimentConfig:
             )
             if self.ablation:
                 self.experiment_id += f"__{self.ablation}"
+            if self.attack_scale != 10.0:
+                self.experiment_id += f"__scale{self.attack_scale:g}"
 
 
 @dataclass
@@ -516,21 +520,29 @@ def _create_model(dataset: str, model_type: str) -> nn.Module:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
 
-def _evaluate_model(model: nn.Module, test_loader: DataLoader, device: str = "cpu") -> float:
-    """Evaluate global model accuracy on test set.
+def _evaluate_model(model: nn.Module, test_loader: DataLoader, device: str = "cpu") -> tuple:
+    """Evaluate global model accuracy and loss on test set.
 
-    Uses the same logic as ``run_pipeline.evaluate_model``.
+    Returns
+    -------
+    (accuracy, avg_loss) : (float, float)
     """
     model.eval()
+    criterion = nn.CrossEntropyLoss()
     correct = total = 0
+    total_loss = 0.0
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * labels.size(0)
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-    return correct / total if total > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
+    avg_loss = total_loss / total if total > 0 else 0.0
+    return accuracy, avg_loss
 
 
 def _inject_attack(
@@ -680,7 +692,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     logger.info("[Phase: MODEL] Creating and initializing model...")
     global_model = _create_model(cfg.dataset, cfg.model_type).to(device)
     num_params = count_parameters(global_model)
-    initial_accuracy = _evaluate_model(global_model, test_loader, device)
+    initial_accuracy, _ = _evaluate_model(global_model, test_loader, device)
     logger.info(
         f"  Model:            {type(global_model).__name__}\n"
         f"  Parameters:       {num_params:,}\n"
@@ -689,15 +701,17 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     )
 
     num_byzantine = int(cfg.num_clients * cfg.byzantine_fraction)
+    import random as _random_mod
+    byz_rng = _random_mod.Random(cfg.seed)  # Reproducible randomization for Byzantine selection
     if num_byzantine > 0:
-        import random
-        rng = random.Random(cfg.seed)  # Reproducible randomization
-        byzantine_ids: Set[int] = set(rng.sample(range(cfg.num_clients), num_byzantine))
+        # First-round IDs (will be re-sampled each round)
+        byzantine_ids: Set[int] = set(byz_rng.sample(range(cfg.num_clients), num_byzantine))
         logger.info(
             f"[Phase: BYZANTINE] {num_byzantine}/{cfg.num_clients} Byzantine clients "
-            f"({cfg.byzantine_fraction:.0%}) — IDs: {sorted(byzantine_ids)}"
+            f"({cfg.byzantine_fraction:.0%}) — randomized each round"
         )
         logger.info(f"  Attack type: {cfg.attack}, scale={cfg.attack_scale}")
+        logger.info(f"  Round 0 IDs: {sorted(byzantine_ids)}")
     else:
         byzantine_ids: Set[int] = set()
         logger.info("[Phase: BYZANTINE] No Byzantine clients (clean run)")
@@ -710,7 +724,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
         defense_config = {
             "layer3_method": "multi_krum",
             "layer3_krum_f": max(1, num_byzantine),
-            "layer3_krum_m": max(1, cfg.num_clients // cfg.num_galaxies - num_byzantine - 2),
+            "layer3_krum_m": max(1, max(1, cfg.num_clients // cfg.num_galaxies) - num_byzantine - 2),
         }
         pipeline = ProtoGalaxyPipeline(
             global_model=global_model,
@@ -719,7 +733,7 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             defense_config=defense_config,
         )
         logger.info(
-            f"  Strategy: Multi-Krum\n"
+            f"  Strategy: Multi-Krum (no ZKP)\n"
             f"  krum_f={defense_config['layer3_krum_f']} (expected Byzantine), "
             f"krum_m={defense_config['layer3_krum_m']} (selection count)"
         )
@@ -751,9 +765,12 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             f"  Trust scores computed per-round via cosine similarity"
         )
     elif cfg.defense == "protogalaxy_full":
+        _cpg = max(1, cfg.num_clients // cfg.num_galaxies)
         defense_config = {
             "layer3_method": cfg.aggregation_method,
             "layer3_trim_ratio": cfg.trim_ratio,
+            "layer3_krum_f": max(1, num_byzantine),
+            "layer3_krum_m": max(1, _cpg - max(1, num_byzantine) - 2),
         }
         pipeline = ProtoGalaxyPipeline(
             global_model=global_model,
@@ -768,6 +785,31 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             f"  L3: Robust Aggregation ({cfg.aggregation_method}, trim={cfg.trim_ratio})\n"
             f"  L4: Reputation Management\n"
             f"  L5: ZKP Norm-Bounded Proofs (ProtoGalaxy IVC)"
+        )
+    elif cfg.defense == "fizk_norm":
+        # FiZK-Norm: same robust norm bounds as FiZK-Full but WITHOUT ZKP proof
+        # generation/verification.  Used to isolate whether accuracy gains come
+        # from the norm filter or from the ZKP itself.
+        _cpg = max(1, cfg.num_clients // cfg.num_galaxies)
+        defense_config = {
+            "layer3_method": cfg.aggregation_method,
+            "layer3_trim_ratio": cfg.trim_ratio,
+            "layer3_krum_f": max(1, num_byzantine),
+            "layer3_krum_m": max(1, _cpg - max(1, num_byzantine) - 2),
+        }
+        pipeline = ProtoGalaxyPipeline(
+            global_model=global_model,
+            num_clients=cfg.num_clients,
+            num_galaxies=cfg.num_galaxies,
+            defense_config=defense_config,
+        )
+        logger.info(
+            f"  Strategy: FiZK-Norm (Norm Filter Only, No ZKP)\n"
+            f"  L1: Commitment + Merkle Tree\n"
+            f"  L2: Statistical Analysis (z-score, MAD)\n"
+            f"  L3: Robust Aggregation ({cfg.aggregation_method}, trim={cfg.trim_ratio})\n"
+            f"  L4: Reputation Management\n"
+            f"  L5: Norm bound enforced by server-side Python check (no ZKP)"
         )
     else:
         raise ValueError(f"Unknown defense: {cfg.defense}")
@@ -805,6 +847,11 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
     for round_num in range(cfg.num_rounds):
         rmetrics = RoundMetrics(round_num=round_num)
         round_start = time.perf_counter()
+
+        # Re-sample Byzantine IDs each round (reproducible via per-round seed)
+        if num_byzantine > 0:
+            byzantine_ids = set(byz_rng.sample(range(cfg.num_clients), num_byzantine))
+            logger.debug(f"Round {round_num}: Byzantine IDs = {sorted(byzantine_ids)}")
         logger.debug(f"Round {round_num}/{cfg.num_rounds} — starting local training")
 
         client_trainers: Dict[int, Trainer] = {}
@@ -817,13 +864,26 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
             trainer.train(loader, num_epochs=cfg.local_epochs)
             grads = trainer.get_gradients()
 
-            if cid in byzantine_ids and cfg.attack not in ("none", "adaptive", "sybil"):
+            if cid in byzantine_ids and cfg.attack not in (
+                "none", "adaptive", "sybil",
+                "gradient_substitution",   # phase1 uses honest grads; phase2 substitutes
+                "compromised_aggregator",  # same as model_poisoning but aggregator cheats
+            ):
                 grads = _inject_attack(
                     grads, cfg.attack, cid,
                     attack_scale=cfg.attack_scale,
                     backdoor_scale=cfg.backdoor_scale,
                 )
                 logger.debug(f"    Client {cid}: injected {cfg.attack} attack (scale={cfg.attack_scale})")
+            elif cid in byzantine_ids and cfg.attack == "compromised_aggregator":
+                # Large-scale poisoned grads so the norm filter WOULD catch them
+                # (if not bypassed by the compromised aggregator)
+                grads = _inject_attack(
+                    grads, "model_poisoning", cid,
+                    attack_scale=cfg.attack_scale,
+                    backdoor_scale=cfg.backdoor_scale,
+                )
+                logger.debug(f"    Client {cid}: compromised_aggregator — model_poisoning scale={cfg.attack_scale}")
 
             client_trainers[cid] = trainer
             client_grads[cid] = grads
@@ -872,8 +932,9 @@ def run_single_experiment(cfg: ExperimentConfig) -> ExperimentResult:
                 round_num, cfg, rmetrics, byzantine_ids,
             )
 
-        accuracy = _evaluate_model(global_model, test_loader, device)
+        accuracy, round_loss = _evaluate_model(global_model, test_loader, device)
         rmetrics.accuracy = accuracy
+        rmetrics.loss = round_loss
 
         flagged_set = set(rmetrics.flagged_client_ids)
         honest_ids = set(range(cfg.num_clients)) - byzantine_ids
@@ -1102,15 +1163,20 @@ def _run_protogalaxy_round(
     skipped.  If ``cfg.ablation == 'zk_merkle'``, all ZKP steps are included.
     """
     pipeline.current_round = round_num
-    enable_zkp = cfg.ablation != "merkle_only"
+    # ZKP is only enabled for protogalaxy_full (not merkle_only ablation).
+    # fizk_norm uses the same norm bounds but skips proof generation entirely.
+    # multi_krum baseline should NOT include ZKP — it's a pure statistical defense.
+    enable_zkp = (cfg.defense == "protogalaxy_full") and (cfg.ablation != "merkle_only")
+    enable_norm_filter = enable_zkp or (cfg.defense == "fizk_norm")
     logger.debug(
         f"  ProtoGalaxy round {round_num}: zkp={'ON' if enable_zkp else 'OFF'}, "
-        f"ablation={cfg.ablation or 'none'}"
+        f"defense={cfg.defense}, ablation={cfg.ablation or 'none'}"
     )
 
     # ==========================
     # PHASE 1: COMMITMENT
     # ==========================
+    round_flagged: Set[int] = set()  # Track all flagged clients across phases
     phase1_start = time.perf_counter()
 
     commitments_by_galaxy: Dict[int, Dict[int, str]] = {}
@@ -1136,7 +1202,9 @@ def _run_protogalaxy_round(
     global_root = pipeline.phase1_global_collect_galaxy_roots(galaxy_roots, round_num)
     rmetrics.merkle_build_time = time.perf_counter() - merkle_build_start
 
-    # ZK proof generation
+    # ZK proof generation / norm-filter-only (fizk_norm ablation)
+    norm_filter_rejected: Set[int] = set()
+    compromised_agg_bypass: Set[int] = set()  # track aggregator-bypassed clients
     if enable_zkp:
         zk_start = time.perf_counter()
         zk_metrics = pipeline.phase1_generate_zk_proofs(client_grads, round_num)
@@ -1148,6 +1216,35 @@ def _run_protogalaxy_round(
             logger.info(
                 f"  ZKP BOUND VIOLATIONS: {bound_failures} client(s) failed "
                 f"proof generation (malicious gradients exceeded server bounds)"
+            )
+    elif enable_norm_filter:
+        # FiZK-Norm: same bounds logic, no cryptographic proof — measures pure
+        # norm-filter accuracy contribution independent of the ZKP.
+        norm_start = time.perf_counter()
+        norm_metrics = pipeline.phase1_apply_norm_filter_only(client_grads, round_num)
+        rmetrics.zk_prove_time = time.perf_counter() - norm_start  # ≈0 (no Rust)
+        rmetrics.zk_proofs_generated = 0
+        rmetrics.zk_mode = "NORM_FILTER_ONLY"
+        norm_filter_rejected = set(norm_metrics.get("rejected_ids", []))
+        round_flagged.update(norm_filter_rejected)  # count rejections in TPR
+        if norm_filter_rejected:
+            logger.info(
+                f"  FiZK-Norm: {len(norm_filter_rejected)} client(s) rejected "
+                f"by norm filter: {sorted(norm_filter_rejected)}"
+            )
+
+        # compromised_aggregator: adversary silently re-admits one rejected
+        # Byzantine client to simulate a dishonest aggregator.  ZKP audit
+        # would catch this (no proof exists); plain norm filter cannot.
+        if cfg.attack == "compromised_aggregator" and norm_filter_rejected & byzantine_ids:
+            bypass_cid = sorted(norm_filter_rejected & byzantine_ids)[0]
+            compromised_agg_bypass.add(bypass_cid)
+            norm_filter_rejected.discard(bypass_cid)   # re-admit
+            logger.info(
+                f"  [COMPROMISED AGGREGATOR] Silently re-admitted client "
+                f"{bypass_cid} (norm-violating Byzantine). "
+                f"ZKP audit: no proof exists \u2192 detectable. "
+                f"FiZK-Norm: undetectable."
             )
     else:
         rmetrics.zk_mode = "DISABLED"
@@ -1175,14 +1272,39 @@ def _run_protogalaxy_round(
     )
     phase2_start = time.perf_counter()
 
+    # gradient_substitution: Byzantine clients committed honest grads in phase1
+    # but now submit poisoned grads.  phase2_galaxy_verify_and_collect checks
+    # the commitment hash; any mismatch is rejected automatically.
+    grads_for_phase2 = dict(client_grads)
+    grad_sub_attempted: Set[int] = set()
+    if cfg.attack == "gradient_substitution":
+        for cid in byzantine_ids:
+            # Substitute with a freshly injected poisoned gradient
+            grads_for_phase2[cid] = _inject_attack(
+                client_grads[cid], "model_poisoning", cid,
+                attack_scale=cfg.attack_scale,
+                backdoor_scale=cfg.backdoor_scale,
+            )
+            grad_sub_attempted.add(cid)
+        if grad_sub_attempted:
+            logger.info(
+                f"  [GRADIENT_SUBSTITUTION] {len(grad_sub_attempted)} Byzantine "
+                f"clients swapped gradients after commitment phase: "
+                f"{sorted(grad_sub_attempted)}"
+            )
+
     galaxy_verified: Dict[int, List[Dict]] = {}
     total_verified = 0
+    grad_sub_caught: Set[int] = set()   # clients caught by commitment mismatch
 
     for galaxy_id in range(cfg.num_galaxies):
         subs = {}
         for cid in commitments_by_galaxy.get(galaxy_id, {}):
+            # Skip clients rejected by norm filter (fizk_norm path)
+            if cid in norm_filter_rejected:
+                continue
             sub = pipeline.phase2_client_submit_gradients(
-                cid, galaxy_id, client_grads[cid],
+                cid, galaxy_id, grads_for_phase2[cid],
                 commitments_by_galaxy[galaxy_id][cid],
                 client_metadata[cid], round_num,
             )
@@ -1190,6 +1312,23 @@ def _run_protogalaxy_round(
         verified, rejected = pipeline.phase2_galaxy_verify_and_collect(galaxy_id, subs)
         galaxy_verified[galaxy_id] = verified
         total_verified += len(verified)
+
+        # Track gradient-substitution detection via commitment mismatch
+        if cfg.attack == "gradient_substitution":
+            verified_ids = {u["client_id"] for u in verified}
+            rejected_ids = {r.get("client_id") for r in rejected if isinstance(r, dict)}
+            for cid in grad_sub_attempted:
+                if cid in rejected_ids and cid % cfg.num_galaxies == galaxy_id:
+                    grad_sub_caught.add(cid)
+                    round_flagged.add(cid)
+
+    if cfg.attack == "gradient_substitution" and grad_sub_attempted:
+        detection_rate = len(grad_sub_caught) / len(grad_sub_attempted)
+        logger.info(
+            f"  [GRADIENT_SUBSTITUTION] Commitment binding: caught "
+            f"{len(grad_sub_caught)}/{len(grad_sub_attempted)} substitutions "
+            f"({detection_rate:.0%} detection rate)"
+        )
 
     # ZK verification
     if enable_zkp:
@@ -1202,9 +1341,10 @@ def _run_protogalaxy_round(
         rmetrics.zk_proofs_verified = zk_verify_metrics.get("zk_verified", 0)
         rmetrics.zk_proofs_failed = zk_verify_metrics.get("zk_failed", 0)
 
-        # Remove ZK-rejected clients
+        # Remove ZK-rejected clients and count them as flagged for TPR
         if zk_verify_metrics.get("zk_rejected_ids"):
             zk_reject_set = set(zk_verify_metrics["zk_rejected_ids"])
+            round_flagged.update(zk_reject_set)  # Count ZKP rejections in detection metrics
             logger.info(
                 f"  ZKP REJECTED {len(zk_reject_set)} client(s): {sorted(zk_reject_set)}"
             )
@@ -1231,7 +1371,6 @@ def _run_protogalaxy_round(
 
     galaxy_agg_grads = {}
     galaxy_defense_reports = {}
-    round_flagged: Set[int] = set()
 
     for galaxy_id, verified_updates in galaxy_verified.items():
         if not verified_updates:
@@ -1240,13 +1379,15 @@ def _run_protogalaxy_round(
         galaxy_agg_grads[galaxy_id] = agg_grads
         galaxy_defense_reports[galaxy_id] = report
 
-        # Collect flagged client IDs
-        for idx in report.get("flagged_clients", []):
-            if idx < len(verified_updates):
-                round_flagged.add(verified_updates[idx]["client_id"])
-        for idx in report.get("statistical_flagged", []):
-            if idx < len(verified_updates):
-                round_flagged.add(verified_updates[idx]["client_id"])
+        # Collect flagged client IDs.
+        # Only count clients that were ACTUALLY excluded by the defense:
+        #   - statistical_flagged = clients failing ≥2 of 4 metrics (removed
+        #     from cleaned_updates before L3 aggregation).
+        # We do NOT include individual layer1/layer2 detections (norm or
+        # direction outliers alone), because those are informational — a
+        # client flagged by only 1 metric is still included in aggregation.
+        for cid in report.get("statistical_flagged", []):
+            round_flagged.add(cid)
 
     # Galaxy submissions
     galaxy_submissions = {}
@@ -1348,9 +1489,9 @@ def _gen_attack_configs(
     configs = []
     for defense, attack, byz_frac in itertools.product(defenses, attacks, byz_fractions):
         for trial in range(trials):
-            agg = "trimmed_mean"
-            if defense == "multi_krum":
-                agg = "multi_krum"
+            agg = "multi_krum"
+            if defense == "vanilla":
+                agg = "trimmed_mean"
             configs.append(ExperimentConfig(
                 mode="attacks",
                 trial_id=trial,
@@ -1411,9 +1552,9 @@ def _gen_scalability_configs(
         for defense in defenses:
             for attack, byz_frac in attacks_byz:
                 for trial in range(trials):
-                    agg = "trimmed_mean"
-                    if defense == "multi_krum":
-                        agg = "multi_krum"
+                    agg = "multi_krum"
+                    if defense == "vanilla":
+                        agg = "trimmed_mean"
                     configs.append(ExperimentConfig(
                         mode="scalability",
                         trial_id=trial,
@@ -1476,7 +1617,16 @@ def generate_experiment_matrix(
     if mode == "custom":
         if custom_cfg is None:
             raise ValueError("custom mode requires --defense, --attack, etc.")
-        return [custom_cfg]
+        # Expand into `trials` independent runs with different seeds
+        expanded = []
+        for trial in range(trials):
+            cfg_t = copy.copy(custom_cfg)
+            cfg_t.trial_id = trial
+            cfg_t.seed = base_seed + trial
+            cfg_t.experiment_id = ""  # force regeneration with correct trial_id + scale
+            cfg_t.__post_init__()
+            expanded.append(cfg_t)
+        return expanded
     raise ValueError(f"Unknown mode: {mode}")
 
 
@@ -1775,7 +1925,7 @@ def main():
     parser.add_argument("--num-clients", type=int, default=20)
     parser.add_argument("--num-galaxies", type=int, default=4)
     parser.add_argument("--byzantine-fraction", type=float, default=0.0)
-    parser.add_argument("--aggregation-method", type=str, default="trimmed_mean",
+    parser.add_argument("--aggregation-method", type=str, default="multi_krum",
                         choices=["trimmed_mean", "multi_krum", "coordinate_wise_median"])
     parser.add_argument("--trim-ratio", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "cifar10"])
@@ -1787,6 +1937,8 @@ def main():
     parser.add_argument("--ablation", type=str, default="",
                         choices=["", "merkle_only", "zk_merkle"])
     parser.add_argument("--dirichlet-alpha", type=float, default=0.5)
+    parser.add_argument("--attack-scale", type=float, default=10.0,
+                        help="Multiplier for Byzantine gradient magnitude (default 10.0)")
 
     args = parser.parse_args()
 
@@ -1794,7 +1946,21 @@ def main():
     log_level = logging.DEBUG if args.verbose else logging.INFO
     log_dir = Path(args.output_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"eval_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    # Build descriptive log filename from CLI args
+    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if args.mode == "custom":
+        _byz_pct = int(args.byzantine_fraction * 100)
+        _abl = f"__{args.ablation}" if args.ablation else ""
+        _part = f"_{args.partition}" if args.partition != "iid" else ""
+        _agg = f"_{args.aggregation_method}" if args.defense not in ("vanilla",) else ""
+        log_tag = (
+            f"{args.defense}{_agg}__{args.attack}"
+            f"__c{args.num_clients}_g{args.num_galaxies}"
+            f"__byz{_byz_pct}{_part}{_abl}"
+        )
+    else:
+        log_tag = args.mode
+    log_file = log_dir / f"eval_{log_tag}_{_ts}.log"
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
@@ -1815,9 +1981,28 @@ def main():
     root_logger.addHandler(file_handler)
     logger.info(f"Log file: {log_file}")
 
+    # Log experiment header to file for easy parsing later
+    if args.mode == "custom":
+        logger.info("=" * 72)
+        logger.info("EXPERIMENT CONFIGURATION")
+        logger.info("=" * 72)
+        logger.info(f"  Defense:           {args.defense}")
+        logger.info(f"  Aggregation:       {args.aggregation_method}")
+        logger.info(f"  Attack:            {args.attack}")
+        logger.info(f"  Byzantine frac:    {args.byzantine_fraction:.0%}")
+        logger.info(f"  Partition:         {args.partition}")
+        logger.info(f"  Dataset:           {args.dataset} / {args.model_type}")
+        logger.info(f"  Clients/Galaxies:  {args.num_clients} / {args.num_galaxies}")
+        logger.info(f"  Rounds:            {args.num_rounds}")
+        logger.info(f"  Trials:            {args.trials}")
+        logger.info(f"  Ablation:          {args.ablation or 'none'}")
+        logger.info(f"  Seed:              {args.base_seed}")
+        logger.info("=" * 72)
+
     # Build experiment matrix
     custom_cfg = None
     if args.mode == "custom":
+        # trial_id and seed will be overridden per-trial in generate_experiment_matrix
         custom_cfg = ExperimentConfig(
             mode="custom",
             defense=args.defense,
@@ -1836,6 +2021,9 @@ def main():
             num_rounds=args.num_rounds,
             ablation=args.ablation,
             dirichlet_alpha=args.dirichlet_alpha,
+            attack_scale=args.attack_scale,
+            trial_id=0,
+            seed=args.base_seed,
         )
 
     configs = generate_experiment_matrix(
