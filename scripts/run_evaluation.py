@@ -1316,7 +1316,8 @@ def _run_protogalaxy_round(
         # Track gradient-substitution detection via commitment mismatch
         if cfg.attack == "gradient_substitution":
             verified_ids = {u["client_id"] for u in verified}
-            rejected_ids = {r.get("client_id") for r in rejected if isinstance(r, dict)}
+            # rejected is a list of plain ints (client_ids)
+            rejected_ids = {r for r in rejected if isinstance(r, int)}
             for cid in grad_sub_attempted:
                 if cid in rejected_ids and cid % cfg.num_galaxies == galaxy_id:
                     grad_sub_caught.add(cid)

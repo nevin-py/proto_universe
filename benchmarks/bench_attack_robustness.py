@@ -61,8 +61,18 @@ OUT_DIR = ROOT / "Eval_results" / "benchmarks" / "attack_robustness" / "custom"
 
 # ── Experiment matrix ──────────────────────────────────────────────────────────
 DEFENSES  = ["vanilla", "multi_krum", "fizk_norm", "protogalaxy_full"]
-ATTACKS   = ["none", "model_poisoning", "backdoor", "label_flip"]
-BYZ_FRAC  = 0.30
+# (attack_name, byz_fraction) — gradient_substitution tested at 3 Byzantine rates
+# to show survivability differences once commitment binding catches all substitutions
+ATTACK_CONFIGS = [
+    ("none",                   0.00),
+    ("model_poisoning",        0.30),
+    ("backdoor",               0.30),
+    ("label_flip",             0.30),
+    ("gradient_substitution",  0.30),
+    ("gradient_substitution",  0.50),
+    ("gradient_substitution",  0.70),
+]
+ATTACKS = list(dict.fromkeys(a for a, _ in ATTACK_CONFIGS))  # unique names, order-preserved
 TRIALS    = 3
 NUM_CLIENTS   = 10
 NUM_GALAXIES  = 2
@@ -75,8 +85,7 @@ def build_configs() -> List[ExperimentConfig]:
     for trial in range(TRIALS):
         seed = 42 + trial
         for defense in DEFENSES:
-            for attack in ATTACKS:
-                byz = BYZ_FRAC if attack != "none" else 0.0
+            for attack, byz in ATTACK_CONFIGS:
                 cfg = ExperimentConfig(
                     mode="custom",
                     trial_id=trial,
@@ -143,26 +152,25 @@ def print_summary():
     import numpy as np
     groups = defaultdict(list)
     for r in rows:
-        groups[(r["defense"], r["attack"])].append(r)
+        groups[(r["defense"], r["attack"], r["byz"])].append(r)
 
-    header = f"{'Defense':<20} {'Attack':<18} {'Byz':>5} {'Acc':>8} {'F1':>8} {'RT(s)':>8}"
-    print("\n" + "=" * 72)
+    header = f"{'Defense':<20} {'Attack':<25} {'Byz':>5} {'Acc':>8} {'F1':>8} {'RT(s)':>8}"
+    print("\n" + "=" * 80)
     print("Attack Robustness — mean over trials")
-    print("=" * 72)
+    print("=" * 80)
     print(header)
-    print("-" * 72)
+    print("-" * 80)
     for defense in DEFENSES:
-        for attack in ATTACKS:
-            key = (defense, attack)
+        for attack, byz in ATTACK_CONFIGS:
+            key = (defense, attack, byz)
             if key not in groups:
                 continue
             g = groups[key]
             acc = float(np.mean([r["acc"] for r in g]))
             f1  = float(np.mean([r["f1"]  for r in g]))
             rt  = float(np.mean([r["round_t"] for r in g]))
-            byz = g[0]["byz"]
             n   = len(g)
-            print(f"{defense:<20} {attack:<18} {byz:>5.0%} {acc:>8.4f} {f1:>8.4f} {rt:>8.1f}  (n={n})")
+            print(f"{defense:<20} {attack:<25} {byz:>5.0%} {acc:>8.4f} {f1:>8.4f} {rt:>8.1f}  (n={n})")
     print()
 
 

@@ -72,7 +72,9 @@ SCENARIOS = [
     # (attack_name,               byz_frac,  description)
     ("none",                      0.0,   "Clean baseline — no attack"),
     ("model_poisoning",           0.30,  "Standard attack — ZKP and filter both catch"),
-    ("gradient_substitution",     0.30,  "Bypass via commit-then-substitute"),
+    ("gradient_substitution",     0.30,  "Bypass via commit-then-substitute (30% byz)"),
+    ("gradient_substitution",     0.50,  "High-rate substitution — robustness under pressure"),
+    ("gradient_substitution",     0.70,  "Extreme-rate substitution — system survivability"),
     ("compromised_aggregator",    0.20,  "Server bypasses norm filter for 1 client"),
 ]
 TRIALS       = 3
@@ -143,6 +145,7 @@ def print_summary():
             rows.append({
                 "defense": c["defense"],
                 "attack":  c["attack"],
+                "byz":     c["byzantine_fraction"],
                 "trial":   c["trial_id"],
                 "acc":     d["final_accuracy"],
                 "f1":      d["avg_f1"],
@@ -154,19 +157,19 @@ def print_summary():
 
     groups = defaultdict(list)
     for r in rows:
-        groups[(r["defense"], r["attack"])].append(r)
+        groups[(r["defense"], r["attack"], r["byz"])].append(r)
 
-    attack_order = [a for a, _, _ in SCENARIOS]
+    attack_order = [(a, b) for a, b, _ in SCENARIOS]
 
-    print("\n" + "=" * 82)
+    print("\n" + "=" * 90)
     print("ZKP Security Value — mean over trials")
     print("  zk_fail = total ZKP proof failures across all rounds (>0 = cryptographic rejection)")
-    print("=" * 82)
-    print(f"{'Defense':<22} {'Attack':<28} {'Acc':>8} {'F1':>8} {'RT(s)':>8} {'ZKFail':>8}  n")
-    print("-" * 82)
+    print("=" * 90)
+    print(f"{'Defense':<22} {'Attack':<28} {'Byz':>5} {'Acc':>8} {'F1':>8} {'RT(s)':>8} {'ZKFail':>8}  n")
+    print("-" * 90)
     for defense in DEFENSES:
-        for attack in attack_order:
-            key = (defense, attack)
+        for attack, byz in attack_order:
+            key = (defense, attack, byz)
             if key not in groups:
                 continue
             g   = groups[key]
@@ -175,23 +178,32 @@ def print_summary():
             rt  = float(np.mean([r["rt"]      for r in g]))
             zkf = float(np.mean([r["zk_fail"] for r in g]))
             n   = len(g)
-            print(f"{defense:<22} {attack:<28} {acc:>8.4f} {f1:>8.4f} {rt:>8.1f} {zkf:>8.1f}  {n}")
+            print(f"{defense:<22} {attack:<28} {byz:>5.0%} {acc:>8.4f} {f1:>8.4f} {rt:>8.1f} {zkf:>8.1f}  {n}")
         print()
 
     print()
-    print("Key comparisons:")
-    for attack in ["gradient_substitution", "compromised_aggregator"]:
-        fn_key = ("fizk_norm",        attack)
-        pg_key = ("protogalaxy_full", attack)
+    print("Key comparisons (ZKP survivability at high Byzantine rates):")
+    seen = set()
+    for attack, byz, _ in SCENARIOS:
+        if attack not in ("gradient_substitution", "compromised_aggregator"):
+            continue
+        if (attack, byz) in seen:
+            continue
+        seen.add((attack, byz))
+        fn_key = ("fizk_norm",        attack, byz)
+        pg_key = ("protogalaxy_full", attack, byz)
+        if fn_key not in groups and pg_key not in groups:
+            continue
+        print(f"  {attack} @ {byz:.0%} byz:")
+        for label, key in [("fizk_norm", fn_key), ("protogalaxy_full", pg_key)]:
+            if key in groups:
+                g = groups[key]
+                acc = float(np.mean([r["acc"] for r in g]))
+                zkf = float(np.mean([r["zk_fail"] for r in g]))
+                print(f"    {label:<20} acc={acc:.4f}  zk_fail={zkf:.1f}")
         if fn_key in groups and pg_key in groups:
-            fn_acc = float(np.mean([r["acc"] for r in groups[fn_key]]))
-            pg_acc = float(np.mean([r["acc"] for r in groups[pg_key]]))
-            fn_zk  = float(np.mean([r["zk_fail"] for r in groups[fn_key]]))
-            pg_zk  = float(np.mean([r["zk_fail"] for r in groups[pg_key]]))
-            print(f"  {attack}:")
-            print(f"    fizk_norm        acc={fn_acc:.4f}  zk_fail={fn_zk:.1f}")
-            print(f"    protogalaxy_full acc={pg_acc:.4f}  zk_fail={pg_zk:.1f}")
-            diff = pg_zk - fn_zk
+            diff = float(np.mean([r["zk_fail"] for r in groups[pg_key]])) \
+                 - float(np.mean([r["zk_fail"] for r in groups[fn_key]]))
             if diff > 0:
                 print(f"    -> ZKP adds {diff:.0f} cryptographic rejections per run")
     print()

@@ -604,7 +604,24 @@ class ProtoGalaxyPipeline:
                 if self.logger:
                     self.logger.warning(f"Invalid Merkle proof for client {client_id}")
                 continue
-            
+
+            # ── Commitment binding check (Architecture Section 4.1) ──
+            # Verify that the gradients submitted NOW hash to the same
+            # commitment that was registered in Phase 1.  Without this,
+            # a Byzantine client can commit to honest gradients and then
+            # substitute poisoned ones — the Merkle proof passes but the
+            # gradients are different.
+            commitment_obj = self.round_commitment_objects.get(client_id)
+            if commitment_obj is not None:
+                if not commitment_obj.verify(submission.gradients):
+                    rejected_clients.append(client_id)
+                    if self.logger:
+                        self.logger.warning(
+                            f"Commitment binding violation for client {client_id}: "
+                            f"submitted gradients do not match Phase-1 commitment"
+                        )
+                    continue
+
             # Store verified submission with raw gradients.
             # Trust-weighted aggregation (Architecture Section 4.4) is applied
             # AFTER defense filtering in Phase 3, not here, so that the
