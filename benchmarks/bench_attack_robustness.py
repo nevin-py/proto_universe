@@ -67,7 +67,7 @@ TRIALS    = 3
 NUM_CLIENTS   = 10
 NUM_GALAXIES  = 2
 NUM_ROUNDS    = 10
-MODEL_TYPE    = "mlp"          # 109K params, 6 gradient tensors/client
+MODEL_TYPE    = "linear"       # 7,850 params, 2 gradient tensors/client — fast enough for ZKP
 
 
 def build_configs() -> List[ExperimentConfig]:

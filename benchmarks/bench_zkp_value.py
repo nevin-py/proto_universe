@@ -79,7 +79,7 @@ TRIALS       = 3
 NUM_CLIENTS  = 10
 NUM_GALAXIES = 2
 NUM_ROUNDS   = 8
-MODEL_TYPE   = "mlp"
+MODEL_TYPE   = "linear"   # 7,850 params — fast enough for ZKP overhead comparison
 
 
 def build_configs() -> List[ExperimentConfig]:
