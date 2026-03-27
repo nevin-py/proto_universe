@@ -1,0 +1,41 @@
+Defense,Attack,Byz %,Partition,N,Acc mean,Acc std
+Vanilla FedAvg,Clean,0,IID,3,81.78,0.55
+Vanilla FedAvg,Clean,0,DIRICHLET,3,79.55,1.51
+Vanilla FedAvg,Model Poison.,30,IID,3,10.00,0.00
+Vanilla FedAvg,Model Poison.,30,DIRICHLET,3,10.00,0.00
+Vanilla FedAvg,Model Poison.,50,IID,3,10.00,0.00
+Vanilla FedAvg,Model Poison.,50,DIRICHLET,3,10.00,0.00
+Vanilla FedAvg,Label Flip,30,IID,3,10.00,0.00
+Vanilla FedAvg,Label Flip,30,DIRICHLET,3,10.00,0.00
+Vanilla FedAvg,Label Flip,50,IID,3,10.00,0.00
+Vanilla FedAvg,Label Flip,50,DIRICHLET,3,10.00,0.00
+Vanilla FedAvg,Backdoor,30,IID,3,81.88,0.82
+Vanilla FedAvg,Backdoor,30,DIRICHLET,3,79.44,1.58
+Vanilla FedAvg,Backdoor,50,IID,3,81.41,0.49
+Vanilla FedAvg,Backdoor,50,DIRICHLET,3,78.79,1.33
+Multi-Krum,Clean,0,IID,3,81.64,0.33
+Multi-Krum,Clean,0,DIRICHLET,3,74.37,3.51
+Multi-Krum,Model Poison.,30,IID,3,32.52,29.33
+Multi-Krum,Model Poison.,30,DIRICHLET,3,75.44,2.32
+Multi-Krum,Model Poison.,50,DIRICHLET,2,64.96,0.38
+Multi-Krum,Label Flip,30,IID,3,47.23,25.13
+Multi-Krum,Label Flip,30,DIRICHLET,3,75.50,2.31
+Multi-Krum,Label Flip,50,DIRICHLET,2,68.34,4.34
+Multi-Krum,Backdoor,30,IID,3,76.16,9.91
+Multi-Krum,Backdoor,30,DIRICHLET,3,69.85,14.84
+Multi-Krum,Backdoor,50,IID,3,74.06,3.23
+Multi-Krum,Backdoor,50,DIRICHLET,3,61.08,2.39
+ProtoGalaxy (ours),Clean,0,IID,3,81.36,0.44
+ProtoGalaxy (ours),Clean,0,DIRICHLET,3,72.40,1.37
+ProtoGalaxy (ours),Model Poison.,30,IID,3,81.56,0.31
+ProtoGalaxy (ours),Model Poison.,30,DIRICHLET,3,76.40,2.78
+ProtoGalaxy (ours),Model Poison.,50,IID,3,81.46,0.71
+ProtoGalaxy (ours),Model Poison.,50,DIRICHLET,3,56.30,32.39
+ProtoGalaxy (ours),Label Flip,30,IID,3,81.59,0.31
+ProtoGalaxy (ours),Label Flip,30,DIRICHLET,3,76.26,2.91
+ProtoGalaxy (ours),Label Flip,50,IID,3,81.33,0.79
+ProtoGalaxy (ours),Label Flip,50,DIRICHLET,3,60.78,23.97
+ProtoGalaxy (ours),Backdoor,30,IID,3,81.54,0.45
+ProtoGalaxy (ours),Backdoor,30,DIRICHLET,3,76.30,2.87
+ProtoGalaxy (ours),Backdoor,50,IID,3,81.29,0.58
+ProtoGalaxy (ours),Backdoor,50,DIRICHLET,3,73.50,1.50

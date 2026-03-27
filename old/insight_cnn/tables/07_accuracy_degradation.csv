@@ -1,0 +1,19 @@
+Defense,Attack,Byz %,Clean acc (%),Attack acc (%),Drop (pp),TPR (%)
+Vanilla FedAvg,Model Poison.,30,81.8,10.0 ± 0.0,71.8,0.0 ± 0.0
+Vanilla FedAvg,Model Poison.,50,81.8,10.0 ± 0.0,71.8,0.0 ± 0.0
+Vanilla FedAvg,Label Flip,30,81.8,10.0 ± 0.0,71.8,0.0 ± 0.0
+Vanilla FedAvg,Label Flip,50,81.8,10.0 ± 0.0,71.8,0.0 ± 0.0
+Vanilla FedAvg,Backdoor,30,81.8,81.9 ± 0.8,-0.1,0.0 ± 0.0
+Vanilla FedAvg,Backdoor,50,81.8,81.4 ± 0.5,0.4,0.0 ± 0.0
+Multi-Krum,Model Poison.,30,81.6,32.5 ± 29.3,49.1,77.8 ± 8.7
+Multi-Krum,Label Flip,30,81.6,47.2 ± 25.1,34.4,79.2 ± 7.2
+Multi-Krum,Backdoor,30,81.6,76.2 ± 9.9,5.5,79.2 ± 7.2
+Multi-Krum,Backdoor,50,81.6,74.1 ± 3.2,7.6,38.3 ± 1.4
+ProtoGalaxy (ours),Model Poison.,30,81.4,81.6 ± 0.3,-0.2,100.0 ± 0.0
+ProtoGalaxy (ours),Model Poison.,50,81.4,81.5 ± 0.7,-0.1,100.0 ± 0.0
+ProtoGalaxy (ours),Label Flip,30,81.4,81.6 ± 0.3,-0.2,100.0 ± 0.0
+ProtoGalaxy (ours),Label Flip,50,81.4,81.3 ± 0.8,0.0,100.0 ± 0.0
+ProtoGalaxy (ours),Backdoor,30,81.4,81.5 ± 0.4,-0.2,100.0 ± 0.0
+ProtoGalaxy (ours),Backdoor,50,81.4,81.3 ± 0.6,0.1,100.0 ± 0.0
+ProtoGalaxy (ours),Grad. Subst.,30,81.4,81.5 ± 0.2,-0.2,100.0 ± 0.0
+ProtoGalaxy (ours),Comp. Agg.,30,81.4,81.6 ± 0.3,-0.3,100.0 ± 0.0

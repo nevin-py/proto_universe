@@ -1212,6 +1212,14 @@ def _run_protogalaxy_round(
         rmetrics.zk_proofs_generated = zk_metrics.get("proofs_generated", 0)
         rmetrics.zk_mode = zk_metrics.get("mode", "NONE")
         bound_failures = zk_metrics.get("bound_failures", 0)
+        # Clients that failed at PROVE time have no valid ZK proof.
+        # Exclude them from Phase 2 submissions immediately — they must not
+        # reach aggregation regardless of whether all-clients-fail triggers
+        # the phase2_verify_zk_proofs early-exit.
+        prove_failed_ids = set(zk_metrics.get("prove_failed_ids", []))
+        if prove_failed_ids:
+            norm_filter_rejected.update(prove_failed_ids)
+            round_flagged.update(prove_failed_ids)
         if bound_failures > 0:
             logger.info(
                 f"  ZKP BOUND VIOLATIONS: {bound_failures} client(s) failed "
@@ -1340,7 +1348,12 @@ def _run_protogalaxy_round(
         zk_verify_metrics = pipeline.phase2_verify_zk_proofs(all_verified_ids)
         rmetrics.zk_verify_time = time.perf_counter() - zk_verify_start
         rmetrics.zk_proofs_verified = zk_verify_metrics.get("zk_verified", 0)
-        rmetrics.zk_proofs_failed = zk_verify_metrics.get("zk_failed", 0)
+        # zk_proofs_failed = prove-time failures + verify-time failures
+        # (prove-time failures are already excluded from Phase 2 submissions,
+        # so zk_verify_metrics["zk_failed"] only counts verify-time failures)
+        rmetrics.zk_proofs_failed = (
+            zk_verify_metrics.get("zk_failed", 0) + bound_failures
+        )
 
         # Remove ZK-rejected clients and count them as flagged for TPR
         if zk_verify_metrics.get("zk_rejected_ids"):
@@ -1413,26 +1426,39 @@ def _run_protogalaxy_round(
         galaxy_submissions
     )
 
-    layer5_result = pipeline.phase4_layer5_galaxy_defense(verified_galaxies)
+    if not verified_galaxies:
+        # All clients were excluded by ZKP (prove or verify failures) this round.
+        # Do NOT update the model — preserve it unchanged.  This is the correct
+        # cryptographic behaviour: if no trusted gradient exists, skip the round.
+        logger.warning(
+            f"  Round {round_num}: ALL clients excluded by ZKP — "
+            f"model update skipped (model preserved)"
+        )
+        global_defense_report = {
+            'flagged_galaxies': [], 'layer5_flagged_galaxies': [],
+            'aggregation_method': 'none', 'galaxy_reputations': {},
+        }
+    else:
+        layer5_result = pipeline.phase4_layer5_galaxy_defense(verified_galaxies)
 
-    global_grads, global_defense_report = pipeline.phase4_global_defense_and_aggregate(
-        verified_galaxies, layer5_result=layer5_result,
-    )
+        global_grads, global_defense_report = pipeline.phase4_global_defense_and_aggregate(
+            verified_galaxies, layer5_result=layer5_result,
+        )
 
-    pipeline.phase4_update_global_model(global_grads)
+        pipeline.phase4_update_global_model(global_grads)
 
-    # ZK folding
-    if enable_zkp:
-        clean_galaxy_ids = [
-            u["galaxy_id"] for u in verified_galaxies
-            if u["galaxy_id"] not in set(
-                global_defense_report.get("flagged_galaxies", [])
-                + global_defense_report.get("layer5_flagged_galaxies", [])
-            )
-        ]
-        zk_fold_start = time.perf_counter()
-        zk_fold_metrics = pipeline.phase4_fold_galaxy_zk_proofs(clean_galaxy_ids)
-        rmetrics.zk_fold_time = time.perf_counter() - zk_fold_start
+        # ZK folding
+        if enable_zkp:
+            clean_galaxy_ids = [
+                u["galaxy_id"] for u in verified_galaxies
+                if u["galaxy_id"] not in set(
+                    global_defense_report.get("flagged_galaxies", [])
+                    + global_defense_report.get("layer5_flagged_galaxies", [])
+                )
+            ]
+            zk_fold_start = time.perf_counter()
+            zk_fold_metrics = pipeline.phase4_fold_galaxy_zk_proofs(clean_galaxy_ids)
+            rmetrics.zk_fold_time = time.perf_counter() - zk_fold_start
 
     pipeline.phase4_distribute_model()
 

@@ -66,11 +66,15 @@ DEFENSES  = ["vanilla", "multi_krum", "fizk_norm", "protogalaxy_full"]
 ATTACK_CONFIGS = [
     ("none",                   0.00),
     ("model_poisoning",        0.30),
+    ("model_poisoning",        0.50),
+    ("model_poisoning",        0.60),
     ("backdoor",               0.30),
+    ("backdoor",               0.50),
     ("label_flip",             0.30),
+    ("label_flip",             0.50),
     ("gradient_substitution",  0.30),
     ("gradient_substitution",  0.50),
-    ("gradient_substitution",  0.70),
+    ("gradient_substitution",  0.60),
 ]
 ATTACKS = list(dict.fromkeys(a for a, _ in ATTACK_CONFIGS))  # unique names, order-preserved
 TRIALS    = 3

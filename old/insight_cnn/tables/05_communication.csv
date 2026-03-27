@@ -1,0 +1,10 @@
+Defense,Clients,Total (MB)
+Vanilla FedAvg,10,39.5 ± 0.0
+Vanilla FedAvg,30,74.0 ± 0.0
+Vanilla FedAvg,50,123.4 ± 0.0
+Multi-Krum,10,39.5 ± 0.0
+Multi-Krum,30,74.0 ± 0.0
+Multi-Krum,50,123.4 ± 0.0
+ProtoGalaxy (ours),10,39.5 ± 0.0
+ProtoGalaxy (ours),30,74.0 ± 0.0
+ProtoGalaxy (ours),50,123.4 ± 0.0

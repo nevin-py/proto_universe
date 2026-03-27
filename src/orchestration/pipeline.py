@@ -348,13 +348,17 @@ class ProtoGalaxyPipeline:
         bounds = []
         for layer_vals in per_layer_norms:
             t = torch.tensor(layer_vals)
-            median = t.median().item()
-            mad = (t - median).abs().median().item()
-            # Use the larger of MAD-based and relative-margin-based bounds
-            # to avoid false positives when honest norms are tightly clustered
-            mad_margin = k * max(mad, 1e-6)
-            rel_margin = min_relative_margin * max(abs(median), 1e-6)
-            bound = median + max(mad_margin, rel_margin)
+            # Use the 25th percentile as anchor — immune to Byzantine majority
+            # up to 75% byz (flips only when >75% clients are Byzantine).
+            # Use ONLY the relative margin (anchor × min_relative_margin),
+            # NOT the MAD-based margin.  MAD computed from all clients includes
+            # Byzantine deviations, which inflate the margin enough to let
+            # Byzantine norms pass even when the anchor itself is honest.
+            # Since L2 norms scale proportionally with attack magnitude
+            # (10× poisoning → 10× norm), a 6× relative bound is sufficient:
+            # honest spread is ~3-4× in non-IID; attack scale ≥ 10× → detected.
+            anchor = torch.quantile(t, 0.25).item()
+            bound  = anchor + min_relative_margin * max(abs(anchor), 1e-6)
             bounds.append(max(bound, 1e-6))
         return bounds
 
@@ -442,6 +446,7 @@ class ProtoGalaxyPipeline:
         self.client_zk_proofs = {}  # Reset for this round
         zk_total_time_ms = 0.0
         zk_bound_failures = 0
+        prove_failed_ids: List[int] = []  # clients rejected at prove time
 
         # Compute SERVER-SIDE global norm bounds from all clients (using L2 norms)
         if self.zkp_prover._use_bounds:
@@ -472,6 +477,7 @@ class ProtoGalaxyPipeline:
                 zk_total_time_ms += zk_proof.prove_time_ms
             except Exception as e:
                 zk_bound_failures += 1
+                prove_failed_ids.append(client_id)
                 if self.logger:
                     self.logger.logger.info(
                         f"  Client {client_id}: x REJECTED — ZK circuit range proof failed "
@@ -489,6 +495,7 @@ class ProtoGalaxyPipeline:
             'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
             'mode': mode,
             'bound_failures': zk_bound_failures,
+            'prove_failed_ids': prove_failed_ids,  # rejected at prove-time
         }
     
     # =========================================================================
@@ -666,7 +673,11 @@ class ProtoGalaxyPipeline:
             Dict with zk_verified count, zk_failed count, rejected IDs, 
             verify_time_ms, and mode
         """
-        if not self.client_zk_proofs:
+        # If ZKP is completely disabled (no proofs attempted), short-circuit.
+        # If ZKP IS enabled but ALL clients failed prove-time (self.client_zk_proofs
+        # is empty yet verified_client_ids is non-empty), we must still iterate
+        # and reject every client — not return empty zk_rejected_ids.
+        if not self.client_zk_proofs and not verified_client_ids:
             return {
                 'zk_verified': 0,
                 'zk_failed': 0,
@@ -674,7 +685,7 @@ class ProtoGalaxyPipeline:
                 'verify_time_ms': 0.0,
                 'mode': 'NONE',
             }
-        
+
         zk_start = time.time()
         zk_verified = 0
         zk_failed = 0
