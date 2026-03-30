@@ -69,6 +69,8 @@ Cargo.lock
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+*.png
+*.pdf
 
 # Logs
 *.log
