@@ -13,6 +13,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 
+import copy
+
 from src.communication.message import (
     Message, MessageType, 
     create_model_update_msg, create_round_start_msg, create_round_end_msg
@@ -393,7 +395,7 @@ class FLServer:
                 continue
             
             # Create temporary model copy for client
-            client_model = type(self.model)()
+            client_model = copy.deepcopy(self.model)
             client_model.load_state_dict(self.model.state_dict())
             
             # Train locally

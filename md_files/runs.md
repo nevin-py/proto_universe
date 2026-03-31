@@ -1,0 +1,1 @@
+python scripts/run_evaluation.py --mode custom --defense protogalaxy_full --attack label_flip --partition iid --num-clients 10 --num-galaxies 2 --byzantine-fraction 0.2 --num-rounds 5 --trials 1 --output-dir ./eval_results --verbose 

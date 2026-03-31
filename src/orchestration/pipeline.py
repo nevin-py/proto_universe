@@ -28,7 +28,7 @@ from src.client.verifier import ProofVerifier
 from src.crypto.merkle_adapter import GalaxyMerkleTreeAdapter, GlobalMerkleTreeAdapter
 from src.crypto.utils import generate_timestamp, generate_nonce_hex
 from src.crypto.merkle import compute_hash
-from src.crypto.zkp_prover import GradientSumCheckProver, GalaxyProofFolder, ZKProof
+from src.crypto.zkp_prover import ModelAgnosticProver, GradientProofBundle, EMABoundManager, FingerprintHelper, verify_gradient_proof
 from src.defense.coordinator import DefenseCoordinator
 from src.defense.statistical import StatisticalAnalyzer
 from src.aggregators.galaxy import GalaxyAggregator
@@ -161,14 +161,11 @@ class ProtoGalaxyPipeline:
         self.proof_verifier = ProofVerifier()
         
         # ZKP infrastructure (Architecture Section 3.3 + 4.1)
-        # Proves gradient sum correctness via ProtoGalaxy IVC folding.
-        # Falls back to SHA-256 commitments if Rust module unavailable.
-        self.zkp_prover = GradientSumCheckProver()
-        self.galaxy_proof_folder = GalaxyProofFolder()
-        self.client_zk_proofs: Dict[int, ZKProof] = {}   # client_id -> ZKProof
-        self.galaxy_zk_proofs: Dict[int, ZKProof] = {}    # galaxy_id -> folded ZKProof
-        self.global_norm_bounds: Optional[List[float]] = None  # Server-side norm bounds
-        
+        self.zkp_prover = ModelAgnosticProver(grad_sample_size=4096)
+        self.ema_bound_manager = EMABoundManager()
+        self.client_zk_proofs: Dict[int, GradientProofBundle] = {}   # client_id -> GradientProofBundle
+        self.ref_gradients: Optional[List[torch.Tensor]] = None      # Dynamic reference gradients (architecture.md §4)
+
         # Storage for current round
         self.round_commitments: Dict[int, Dict[int, str]] = {}  # galaxy_id -> {client_id -> hash}
         self.round_submissions: Dict[int, Dict[int, ClientSubmission]] = {}  # galaxy_id -> {client_id -> submission}
@@ -313,99 +310,40 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
-    def _compute_global_norm_bounds(
-        self,
-        client_gradients: Dict[int, List[torch.Tensor]],
-        min_relative_margin: float = 5.0,
-    ) -> List[float]:
-        """Compute server-side norm bounds from all clients using robust statistics.
-
-        For each layer, the bound is:
-            median(L2_norm) + max(k * MAD(L2_norm), min_relative_margin * median)
-
-        The ``min_relative_margin`` floor prevents false positives when honest
-        clients have similar norms (small MAD) — the bound is at least
-        ``(1 + min_relative_margin) × median``.  With 5.0 the bound is 6× median:
-
-          - IID: honest norm variance stays within ~4× median even in late rounds
-            when small gradients create high relative variance.
-          - Non-IID Dirichlet (α=0.1/0.5): natural spread ~3-4× median.
-          - Attack (10× scale): malicious norms are ~10× median → above 6× → caught.
-
-        Uses L2 norms — NOT scalar sums — because gradient values cancel out
-        in large tensors, making sums ≈ 0 for both honest and malicious clients.
-        L2 norms scale proportionally with attack magnitude (10× scale → 10× norm).
-        This prevents malicious clients from setting their own bounds.
-        """
-        num_layers = len(next(iter(client_gradients.values())))
-        k = self.zkp_prover._norm_scale_factor
-
-        per_layer_norms: List[List[float]] = [[] for _ in range(num_layers)]
-        for grads in client_gradients.values():
-            for li, g in enumerate(grads):
-                per_layer_norms[li].append(torch.norm(g).item())  # L2 norm, NOT sum
-
-        bounds = []
-        for layer_vals in per_layer_norms:
-            t = torch.tensor(layer_vals)
-            # Use the 25th percentile as anchor — immune to Byzantine majority
-            # up to 75% byz (flips only when >75% clients are Byzantine).
-            # Use ONLY the relative margin (anchor × min_relative_margin),
-            # NOT the MAD-based margin.  MAD computed from all clients includes
-            # Byzantine deviations, which inflate the margin enough to let
-            # Byzantine norms pass even when the anchor itself is honest.
-            # Since L2 norms scale proportionally with attack magnitude
-            # (10× poisoning → 10× norm), a 6× relative bound is sufficient:
-            # honest spread is ~3-4× in non-IID; attack scale ≥ 10× → detected.
-            anchor = torch.quantile(t, 0.25).item()
-            bound  = anchor + min_relative_margin * max(abs(anchor), 1e-6)
-            bounds.append(max(bound, 1e-6))
-        return bounds
+    def _compute_global_norm_bounds(self, client_gradients: Dict[int, List[torch.Tensor]]) -> List[float]:
+        """Legacy bounding logic (replaced by EMABoundManager). Allowed for backward config testing."""
+        return [1e9] * len(next(iter(client_gradients.values())))
 
     def phase1_apply_norm_filter_only(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
         round_number: int,
     ) -> Dict[str, Any]:
-        """FiZK-Norm ablation: apply robust norm bounds WITHOUT generating ZKP proofs.
-
-        Identical rejection logic to ``phase1_generate_zk_proofs`` — same
-        ``_compute_global_norm_bounds`` formula — but skips all Rust/Sonobe
-        proof generation.  This isolates the accuracy contribution of the norm
-        bound from the cryptographic verifiability added by the ZKP.
-
-        Rejected client IDs are stored in ``self.norm_filter_rejected_ids`` so
-        the caller can feed them into the same ``round_flagged`` tracking used
-        for ZKP rejections.
-
-        Args:
-            client_gradients: Dict mapping client_id -> List[torch.Tensor]
-            round_number: Current FL round (used for logging only)
-
-        Returns:
-            Dict with keys: accepted, rejected, rejected_ids, norm_bounds
-        """
+        """FiZK-Norm ablation: apply robust norm bounds WITHOUT generating ZKP proofs."""
         self.norm_filter_rejected_ids: List[int] = []
-        self.global_norm_bounds = self._compute_global_norm_bounds(client_gradients)
+        
+        client_norms = []
+        for grads in client_gradients.values():
+            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
+            client_norms.append(float(np.linalg.norm(flat)))
+            
+        ema_bound = self.ema_bound_manager.update(client_norms)
 
         if self.logger:
             self.logger.logger.debug(
-                f"[FiZK-Norm] Round {round_number}: bounds (median+5×MAD): "
-                f"{[f'{b:.4f}' for b in self.global_norm_bounds]}"
+                f"[FiZK-Norm] Round {round_number}: EMA bound = {ema_bound:.4f}"
             )
 
         accepted: Dict[int, List[torch.Tensor]] = {}
         for client_id, grads in client_gradients.items():
-            violation = False
-            for li, g in enumerate(grads):
-                if torch.norm(g).item() > self.global_norm_bounds[li]:
-                    violation = True
-                    break
-            if violation:
+            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
+            norm = float(np.linalg.norm(flat))
+            
+            if not self.ema_bound_manager.check(norm):
                 self.norm_filter_rejected_ids.append(client_id)
                 if self.logger:
                     self.logger.logger.info(
-                        f"  [FiZK-Norm] Client {client_id}: x REJECTED — norm violation"
+                        f"  [FiZK-Norm] Client {client_id}: x REJECTED — norm {norm:.4f} > bound {ema_bound:.4f}"
                     )
             else:
                 accepted[client_id] = grads
@@ -414,7 +352,7 @@ class ProtoGalaxyPipeline:
             "accepted": len(accepted),
             "rejected": len(self.norm_filter_rejected_ids),
             "rejected_ids": list(self.norm_filter_rejected_ids),
-            "norm_bounds": self.global_norm_bounds,
+            "norm_bounds": [ema_bound], # wrapper for legacy compatibility
             "accepted_grads": accepted,
         }
 
@@ -424,54 +362,44 @@ class ProtoGalaxyPipeline:
         round_number: int
     ) -> Dict[str, Any]:
         """
-        Phase 1: Generate ZK sum-check proofs for all clients.
-        
-        Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
-          z_0 = 0  ->  z_1 = z_0 + sum(layer_0)  ->  ...  ->  z_n = total_sum
-        
-        Global norm bounds are computed server-side from robust statistics
-        (median + k*MAD) across ALL clients' gradient norms.  Malicious clients
-        with out-of-bound gradients will fail proof generation.
-        
-        The proof is constant-size and verifiable in O(1).
-        Architecture Section 3.3 — Commitment Generator + ZK verification.
+        Phase 1: Generate ZK proofs of gradient authenticity.
         
         Args:
             client_gradients: Dict mapping client_id -> List[torch.Tensor]
             round_number: Current FL round
-            
-        Returns:
-            Dict with ZK metrics (proofs_generated, prove_time_ms, mode)
         """
-        self.client_zk_proofs = {}  # Reset for this round
+        self.client_zk_proofs = {}
         zk_total_time_ms = 0.0
         zk_bound_failures = 0
-        prove_failed_ids: List[int] = []  # clients rejected at prove time
-
-        # Compute SERVER-SIDE global norm bounds from all clients (using L2 norms)
-        if self.zkp_prover._use_bounds:
-            self.global_norm_bounds = self._compute_global_norm_bounds(client_gradients)
-            if self.logger:
-                self.logger.logger.debug(
-                    f"Global norm bounds (median+{self.zkp_prover._norm_scale_factor}*MAD): "
-                    f"{[f'{b:.4f}' for b in self.global_norm_bounds]}"
-                )
-        else:
-            self.global_norm_bounds = None
+        prove_failed_ids: List[int] = []
         
+        # 1. Update EMA Bounds using current round norms
+        client_norms = []
+        for grads in client_gradients.values():
+            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
+            client_norms.append(float(np.linalg.norm(flat)))
+            
+        new_bound = self.ema_bound_manager.update(client_norms)
+        
+        # 2. Compute true model fingerprint
+        model_p = list(self.global_model.parameters())
+        model_fp, _ = FingerprintHelper.compute_model_fingerprint(model_p, round_number)
+
+        # 2b. Compute reference gradient fingerprint
+        if self.ref_gradients is None:
+            self.ref_gradients = [torch.zeros_like(p) for p in model_p]
+        ref_fp, _ = FingerprintHelper.compute_model_fingerprint(self.ref_gradients, round_number)
+
+        # 3. Prove gradients
         for client_id, grads in client_gradients.items():
-            # Pass norm bounds to ZKP prover — the circuit enforces them via
-            # a real 64-bit range proof.  There is NO Python pre-check here so
-            # that the circuit is the genuine enforcer.  If a Byzantine client's
-            # gradient norms exceed the bounds, prove_gradient_sum → Rust
-            # prove_gradient_step returns a SynthesisError and no valid proof
-            # is generated.  phase2_verify_zk_proofs then records zk_failed.
             try:
-                zk_proof = self.zkp_prover.prove_gradient_sum(
+                zk_proof = self.zkp_prover.generate_proof(
                     gradients=grads,
+                    ref_gradients=self.ref_gradients,
+                    model_fp=model_fp,
+                    ref_grad_fp=ref_fp,
                     client_id=client_id,
-                    round_number=round_number,
-                    norm_thresholds=self.global_norm_bounds,  # circuit enforces
+                    round_number=round_number
                 )
                 self.client_zk_proofs[client_id] = zk_proof
                 zk_total_time_ms += zk_proof.prove_time_ms
@@ -480,8 +408,7 @@ class ProtoGalaxyPipeline:
                 prove_failed_ids.append(client_id)
                 if self.logger:
                     self.logger.logger.info(
-                        f"  Client {client_id}: x REJECTED — ZK circuit range proof failed "
-                        f"(Byzantine gradient norm exceeds bound): {e}"
+                        f"  Client {client_id}: x REJECTED — ZK proving failed: {e}"
                     )
         
         num_proofs = len(self.client_zk_proofs)
@@ -495,7 +422,7 @@ class ProtoGalaxyPipeline:
             'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
             'mode': mode,
             'bound_failures': zk_bound_failures,
-            'prove_failed_ids': prove_failed_ids,  # rejected at prove-time
+            'prove_failed_ids': prove_failed_ids,
         }
     
     # =========================================================================
@@ -660,30 +587,12 @@ class ProtoGalaxyPipeline:
         verified_client_ids: List[int]
     ) -> Dict[str, Any]:
         """
-        Phase 2: Verify ZK sum-check proofs for Merkle-verified clients.
-        
-        Clients that passed Merkle verification in Phase 2 are additionally
-        checked for valid ZK sum-check proofs (Architecture Section 4.1).
-        Invalid ZK proofs cause rejection.
-        
-        Args:
-            verified_client_ids: Client IDs that passed Merkle verification
-            
-        Returns:
-            Dict with zk_verified count, zk_failed count, rejected IDs, 
-            verify_time_ms, and mode
+        Phase 2: Verify ZK proofs for Merkle-verified clients.
+        Calls ProtoGalaxy verification and applies server-side EMA norm bound check.
         """
-        # If ZKP is completely disabled (no proofs attempted), short-circuit.
-        # If ZKP IS enabled but ALL clients failed prove-time (self.client_zk_proofs
-        # is empty yet verified_client_ids is non-empty), we must still iterate
-        # and reject every client — not return empty zk_rejected_ids.
         if not self.client_zk_proofs and not verified_client_ids:
             return {
-                'zk_verified': 0,
-                'zk_failed': 0,
-                'zk_rejected_ids': [],
-                'verify_time_ms': 0.0,
-                'mode': 'NONE',
+                'zk_verified': 0, 'zk_failed': 0, 'zk_rejected_ids': [], 'verify_time_ms': 0.0, 'mode': 'NONE',
             }
 
         zk_start = time.time()
@@ -694,17 +603,12 @@ class ProtoGalaxyPipeline:
         for client_id in verified_client_ids:
             zk_proof = self.client_zk_proofs.get(client_id)
             if zk_proof is None:
-                # Client had no proof (likely failed during generation due to
-                # bound violation) — treat as rejected
                 zk_failed += 1
                 zk_rejected_ids.append(client_id)
                 continue
             
-            # Verify using SERVER-SIDE norm bounds (not client-reported)
-            is_valid = GradientSumCheckProver.verify_proof(
-                zk_proof,
-                server_norm_bounds=self.global_norm_bounds,
-            )
+            # verify_gradient_proof calls real PG::verify + checks EMA bound
+            is_valid = verify_gradient_proof(zk_proof, ema_bound=self.ema_bound_manager)
             if is_valid:
                 zk_verified += 1
             else:
@@ -713,8 +617,7 @@ class ProtoGalaxyPipeline:
         
         zk_verify_time_ms = (time.time() - zk_start) * 1000
         mode = "REAL" if (
-            self.client_zk_proofs
-            and next(iter(self.client_zk_proofs.values())).is_real
+            self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real
         ) else "FALLBACK"
         
         return {
@@ -1049,53 +952,11 @@ class ProtoGalaxyPipeline:
         self,
         clean_galaxy_ids: List[int]
     ) -> Dict[str, Any]:
-        """
-        Phase 4: Fold per-client ZK proofs into per-galaxy proofs.
-        
-        Uses ProtoGalaxy's IVC property to fold N client proofs into 1 constant-size
-        galaxy proof (Architecture Section 3.2 — Multi-Level Merkle + ZK).
-        
-        Args:
-            clean_galaxy_ids: List of galaxy IDs that passed defense (non-flagged)
-            
-        Returns:
-            Dict with folding metrics (galaxies_folded, folding_time_ms, mode)
-        """
-        self.galaxy_zk_proofs = {}
-        
-        if not self.client_zk_proofs:
-            return {
-                'galaxies_folded': 0,
-                'folding_time_ms': 0.0,
-                'mode': 'NONE',
-            }
-        
-        fold_start = time.time()
-        
-        for galaxy_id in clean_galaxy_ids:
-            galaxy_client_ids = self.galaxy_assignments.get(galaxy_id, [])
-            galaxy_proofs = [
-                self.client_zk_proofs[cid]
-                for cid in galaxy_client_ids
-                if cid in self.client_zk_proofs
-            ]
-            
-            if galaxy_proofs:
-                folded = self.galaxy_proof_folder.fold_galaxy_proofs(
-                    galaxy_proofs, galaxy_id
-                )
-                self.galaxy_zk_proofs[galaxy_id] = folded
-        
-        folding_time_ms = (time.time() - fold_start) * 1000
-        mode = "REAL" if (
-            self.galaxy_zk_proofs
-            and next(iter(self.galaxy_zk_proofs.values())).is_real
-        ) else "FALLBACK"
-        
+        """Legacy stub logic removed."""
         return {
-            'galaxies_folded': len(self.galaxy_zk_proofs),
-            'folding_time_ms': folding_time_ms,
-            'mode': mode,
+            'galaxies_folded': 0,
+            'folding_time_ms': 0.0,
+            'mode': 'NONE',
         }
     
     def phase4_distribute_model(self) -> Dict:
@@ -1274,6 +1135,9 @@ class ProtoGalaxyPipeline:
         global_gradients, global_defense_report = self.phase4_global_defense_and_aggregate(
             verified_galaxies, layer5_result=layer5_result
         )
+        
+        # Step 4c.1: Update reference gradients for next round's directional constraint
+        self.ref_gradients = [g.clone().detach() for g in global_gradients]
         
         # Step 4d: Update global model
         self.phase4_update_global_model(global_gradients)
