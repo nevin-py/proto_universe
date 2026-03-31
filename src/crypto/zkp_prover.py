@@ -173,6 +173,7 @@ class FingerprintHelper:
         grad_flat_quantized: np.ndarray,
         r_chunks: List[np.ndarray],
         chunk_size: int = CHUNK_SIZE,
+        apply_modulo: bool = True,
     ) -> int:
         """Compute expected fingerprint from pre-quantized gradient and Fiat-Shamir chunks."""
         fp_accum = 0
@@ -184,7 +185,7 @@ class FingerprintHelper:
                 g_slice = np.pad(g_slice, (0, chunk_size - len(g_slice)))
             dot = int(np.sum((r_chunk * SCALE).astype(np.int64) * g_slice))
             fp_accum += dot
-        return fp_accum % QUANT_SAFE
+        return fp_accum % QUANT_SAFE if apply_modulo else fp_accum
 
 
 # ── Cosine Similarity Filter (architecture.md §3.2) ───────────────────────────
@@ -276,7 +277,7 @@ class ModelAgnosticProver:
         rng = np.random.RandomState(seed=round_number * 888_881 + client_id * 11 + 3)
         indices = np.sort(rng.choice(total, size=n, replace=False))
         sampled = grad_flat[indices]
-        quantized = FingerprintHelper.quantize(sampled).astype(np.float64)  # keep as float for Rust f64
+        quantized = FingerprintHelper.quantize(sampled).astype(np.int64)  # strict i64 for Rust
         return quantized, indices
 
     def generate_proof(
@@ -329,13 +330,16 @@ class ModelAgnosticProver:
         while len(r_chunks) < num_chunks:
             r_chunks.append(np.zeros(CHUNK_SIZE))
 
+        # Calculate the precise mathematical reference accumulator to pass to the strict rust bindings
+        true_ref_fp = FingerprintHelper.compute_gradient_fingerprint(ref_padded.astype(np.int64), r_chunks, apply_modulo=False)
+
         if self._is_real:
             bundle_bytes, num_steps, grad_fp, norm_sq_q, dir_fp_q = self._prove_real(
-                model_fp, ref_grad_fp, g_padded, ref_padded, r_chunks, num_chunks
+                model_fp, true_ref_fp, g_padded, ref_padded, r_chunks, num_chunks
             )
         else:
             bundle_bytes, num_steps, grad_fp, norm_sq_q, dir_fp_q = self._prove_fallback(
-                model_fp, ref_grad_fp, g_padded, ref_padded, r_chunks
+                model_fp, true_ref_fp, g_padded, ref_padded, r_chunks
             )
 
         elapsed_ms = (time.time() - start) * 1000
@@ -366,10 +370,15 @@ class ModelAgnosticProver:
         prover = _GradientZKProver()
         prover.initialize(model_fp, ref_grad_fp)
 
+        # Ensure strict int64 bounds for the Rust bridge scaling
+        g_int = g_padded.astype(np.int64)
+        ref_int = ref_padded.astype(np.int64)
+
         for i in range(num_chunks):
-            g_chunk = g_padded[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE].tolist()
-            r_chunk = r_chunks[i].tolist()
-            ref_chunk = ref_padded[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE].tolist()
+            g_chunk = g_int[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE].tolist()
+            # Random variables must also rigorously bind to the same scaler magnitude 
+            r_chunk = (r_chunks[i] * SCALE).astype(np.int64).tolist()
+            ref_chunk = ref_int[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE].tolist()
             prover.prove_chunk(g_chunk, r_chunk, ref_chunk)
 
         bundle = bytes(prover.generate_proof_bundle())
@@ -442,11 +451,11 @@ def verify_gradient_proof(
     if bundle.is_real:
         # Real ProtoGalaxy IVC verification
         try:
-            # Returns (is_valid, norm_sq_str, dir_fp_str) mathematical outputs directly from proof state!
-            ok, norm_str, dir_str = _GradientZKProver.verify_proof_bundle_static(list(bundle.proof_bytes))
+            # Returns (is_valid, norm_sq_str, dir_fp_str, error_msg) mathematical outputs directly from proof state!
+            ok, norm_str, dir_str, msg = _GradientZKProver.verify_proof_bundle_static(list(bundle.proof_bytes))
             if not ok:
-                logger.warning(f"Client {bundle.client_id}: PG::verify FAILED")
-                return False, "PG::verify FAILED"
+                logger.warning(f"Client {bundle.client_id}: PG::verify FAILED ({msg})")
+                return False, f"PG::verify FAILED: {msg}"
 
             import re
             m_norm = re.search(r'BigInt\(\[([^\]]+)\]\)', norm_str)
@@ -495,3 +504,29 @@ def verify_gradient_proof(
         return False, msg
 
     return True, "Valid"
+
+def fold_proofs_bundle(bundles: List[GradientProofBundle]) -> GradientProofBundle:
+    """Phase 4: Multi-prover representation folding. 
+    
+    Synthesizes multiple valid client IVC proofs into a single verifiable bundle pi_gfold.
+    """
+    if not _ZKP_AVAILABLE or not bundles:
+        return bundles[0] if bundles else None
+    
+    bundled_bytes = [list(b.proof_bytes) for b in bundles]
+    folded_bytes = _GradientZKProver.fold_proofs_bundle(bundled_bytes)
+    
+    # Return synthetic fold bundle representing the compressed proofs
+    return GradientProofBundle(
+        proof_bytes=bytes(folded_bytes),
+        model_fp=bundles[0].model_fp,
+        grad_fp=0,
+        norm_sq_quantized=0.0,
+        directional_fp_quantized=0.0,
+        num_steps=0,
+        num_gradient_elements=bundles[0].num_gradient_elements,
+        client_id=0,
+        round_number=bundles[0].round_number,
+        prove_time_ms=0.0,
+        is_real=True,
+    )
