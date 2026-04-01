@@ -192,3 +192,30 @@ Important output files are typically:
   - persist outputs to Drive
 - If submodule errors appear:
   - rerun the submodule sync/update cell
+
+---
+
+## Optional: Apply preserved local `sonobe` patch (important custom changes)
+
+If you need the custom bridge changes that cannot be pushed to upstream `privacy-scaling-explorations/sonobe`, apply the patch bundled in this repo:
+
+```bash
+%%bash
+set -e
+cd /content/proto_universe/proto_system/sonobe
+
+git apply --check ../patches/sonobe/0001-fl-zkp-bridge-update-bridge-api-and-config.patch
+git apply ../patches/sonobe/0001-fl-zkp-bridge-update-bridge-api-and-config.patch
+```
+
+Then rebuild the Python bridge:
+
+```bash
+%%bash
+set -e
+source "$HOME/.cargo/env"
+cd /content/proto_universe/proto_system/sonobe/fl-zkp-bridge
+maturin develop --release
+```
+
+This keeps the main repo reproducible while still preserving your important local `sonobe` edits.

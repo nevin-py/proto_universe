@@ -1,0 +1,1597 @@
+From a058ce9f69b3da60084a7a0e39f92019c8eb71a4 Mon Sep 17 00:00:00 2001
+From: nevin-py <nevinsuniloommen@gmail.com>
+Date: Wed, 1 Apr 2026 11:19:17 +0530
+Subject: [PATCH] fl-zkp-bridge: update bridge API and config
+
+---
+ fl-zkp-bridge/Cargo.toml |    2 +
+ fl-zkp-bridge/src/lib.rs | 1371 +++++++++++++++++++++-----------------
+ 2 files changed, 770 insertions(+), 603 deletions(-)
+
+diff --git a/fl-zkp-bridge/Cargo.toml b/fl-zkp-bridge/Cargo.toml
+index c9f7e4e..d8bc07e 100644
+--- a/fl-zkp-bridge/Cargo.toml
++++ b/fl-zkp-bridge/Cargo.toml
+@@ -27,6 +27,8 @@ ark-relations = { workspace = true }
+ ark-serialize = { workspace = true }
+ ark-std = { workspace = true }
+ ark-crypto-primitives = { workspace = true }
++ark-groth16 = { workspace = true }
++ark-snark = { workspace = true }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ thiserror = "1.0"
+diff --git a/fl-zkp-bridge/src/lib.rs b/fl-zkp-bridge/src/lib.rs
+index 1eeae03..f0be729 100644
+--- a/fl-zkp-bridge/src/lib.rs
++++ b/fl-zkp-bridge/src/lib.rs
+@@ -2,80 +2,84 @@
+ #![allow(non_camel_case_types)]
+ #![allow(clippy::upper_case_acronyms)]
+ 
+-use ark_bn254::{Bn254, Fr, G1Projective as G1};
+-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
++use ark_bn254::{Bn254, Fr, G1Affine, G1Projective as G1};
+ use ark_ec::CurveGroup;
+ use ark_ff::{PrimeField, Zero};
+ use ark_grumpkin::Projective as G2;
+ use ark_groth16::Groth16;
+-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::{fp::FpVar, FieldVar}};
+-use ark_relations::gr1cs::{ConstraintSystem, ConstraintSystemRef, SynthesisError};
+-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+-use ark_snark::SNARK;
+-use ark_std::rand::RngCore;
++use ark_r1cs_std::{alloc::AllocVar, fields::{fp::FpVar, FieldVar}};
++use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
++use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
++use folding_schemes::commitment::kzg::KZG;
+ use folding_schemes::commitment::pedersen::Pedersen;
+-use folding_schemes::folding::protogalaxy::decider_eth::DeciderEthCircuit;
+-use folding_schemes::folding::protogalaxy::ProtoGalaxy;
++use folding_schemes::folding::protogalaxy::decider_eth::Decider as ProtoGalaxyDeciderEth;
++use folding_schemes::folding::protogalaxy::{IVCProof, ProtoGalaxy};
+ use folding_schemes::transcript::poseidon::poseidon_canonical_config;
++use folding_schemes::folding::traits::CommittedInstanceOps;
++use folding_schemes::Decider as DeciderTrait;
+ use folding_schemes::Error;
+ use folding_schemes::{frontend::FCircuit, FoldingScheme};
+ use pyo3::prelude::*;
+-use pyo3::types::PyBytes;
+ use std::marker::PhantomData;
+ 
+ // ============================================================
+-// Constants for the linear MNIST model
++// Model-Agnostic Gradient Fingerprint Circuit
+ // ============================================================
+-const INPUT_DIM: usize = 784;   // 28x28 MNIST pixels
+-const NUM_CLASSES: usize = 10;
+-const WEIGHT_COUNT: usize = INPUT_DIM * NUM_CLASSES; // 7840
+-const BIAS_COUNT: usize = NUM_CLASSES;               // 10
+-
+-// Sampled fingerprint for Byzantine detection
+-// Sample 100 weights instead of all 7840 → 87% constraint reduction
+-// Security: 2^-100 collision probability (cryptographically negligible)
+-const SAMPLE_SIZE: usize = 100;
+-const SAMPLED_W_COUNT: usize = NUM_CLASSES * SAMPLE_SIZE; // 1000
+-
+-// External inputs layout per IVC step:
+-//   [0 .. INPUT_DIM)                               x_j (784 pixel values)
+-//   [INPUT_DIM]                                    y_j (label, 0..9)
+-//   [INPUT_DIM+1 .. INPUT_DIM+1+WEIGHT_COUNT)      W_flat (7840 weights, for forward pass)
+-//   [INPUT_DIM+1+WEIGHT_COUNT .. +BIAS_COUNT)       b (10 biases)
+-//   [.. +NUM_CLASSES)                               r (10 random fingerprint vector)
+-//   [.. +SAMPLED_W_COUNT)                           W_sampled (1000 sampled weights, for fingerprint)
+-const EXT_LEN: usize = INPUT_DIM + 1 + WEIGHT_COUNT + BIAS_COUNT + NUM_CLASSES + SAMPLED_W_COUNT;
+-// = 784 + 1 + 7840 + 10 + 10 + 1000 = 9645
+-
+-// Offsets
+-const OFF_X: usize = 0;
+-const OFF_Y: usize = INPUT_DIM;
+-const OFF_W: usize = INPUT_DIM + 1;
+-const OFF_B: usize = OFF_W + WEIGHT_COUNT;
+-const OFF_R: usize = OFF_B + BIAS_COUNT;
+-const OFF_W_SAMPLED: usize = OFF_R + NUM_CLASSES;
++//
++// Security model:
++//   - Client receives global model with fingerprint F_model = <r_model, flatten(W)>
++//   - Client computes gradient g after real training
++//   - Client sends the FL gradient update + a ZK proof that:
++//       (1) It used a model with the committed fingerprint F_model (in z_0[0])
++//       (2) The gradient fingerprint <r, g> equals the accumulated value in z_i[1]
++//   - Server verifies the IVC proof → accepts gradient only if proof is valid
++//
++// The proof is model-agnostic: it works for any gradient vector regardless of
++// model architecture (linear, MLP, CNN). Only the number of IVC steps changes.
++//
++// CHUNK_SIZE: number of gradient elements proved per IVC step.
++// 50 elements per step → minimal constraint count, reasonable step count for all models.
++// Linear model (7850 params)  → ~157 steps
++// MLP small (101k params)     → ~2020 steps (use sample_size instead for MLP/CNN)
++// We expose a configurable chunk_size at the Python level with a max of CHUNK_SIZE elements.
++//
++// For large models (MLP, CNN), the Python layer samples SAMPLE_GRAD elements from the
++// full gradient and proves only those — same Schwartz-Zippel security argument.
++
++// ====================================================================
++// Architecture Spec (architecture.md Section 2):
++//   C = 2048 parameters per fold step.
++//   Reduces IVC steps for a 7850-param linear model from ~157 → 4 steps.
++//   Each step: 2048 inner-product gates + 2048 squaring gates = 4096 R1CS muls.
++// ====================================================================
++const CHUNK_SIZE: usize = 2048;
+ 
+ // ============================================================
+-// ExternalInputs wrapper for Vec-based external inputs
++// ExternalInputs types for GradientFingerprintCircuit
+ // ============================================================
+-/// External inputs for one IVC step of the training proof circuit.
+-/// Wraps a Vec<F> with a Default that initializes to the correct length.
++
++/// One IVC step's external inputs: [g_chunk, r_chunk, ref_chunk] (CHUNK_SIZE each)
++/// g_chunk: gradient values for this chunk
++/// r_chunk: server-chosen random challenge (Fiat-Shamir)
++/// ref_chunk: reference gradient chunk for directional verification
+ #[derive(Clone, Debug)]
+-pub struct TrainingStepInputs<F: PrimeField> {
+-    pub values: Vec<F>,
++pub struct GradientExternalInputs<F: PrimeField> {
++    pub values: Vec<F>, // always length 3 * CHUNK_SIZE
+ }
+ 
+-// Note: No Default trait - external input length depends on circuit dimensions
+-// Create instances explicitly with correct length based on (input_dim, num_classes, sample_size)
++impl<F: PrimeField> Default for GradientExternalInputs<F> {
++    fn default() -> Self {
++        Self { values: vec![F::zero(); 3 * CHUNK_SIZE] }
++    }
++}
+ 
+-/// Var version for constraint system allocation
+ #[derive(Clone, Debug)]
+-pub struct TrainingStepInputsVar<F: PrimeField> {
++pub struct GradientExternalInputsVar<F: PrimeField> {
+     pub values: Vec<FpVar<F>>,
+ }
+ 
+-impl<F: PrimeField> AllocVar<TrainingStepInputs<F>, F> for TrainingStepInputsVar<F> {
+-    fn new_variable<T: std::borrow::Borrow<TrainingStepInputs<F>>>(
++impl<F: PrimeField> AllocVar<GradientExternalInputs<F>, F> for GradientExternalInputsVar<F> {
++    fn new_variable<T: std::borrow::Borrow<GradientExternalInputs<F>>>(
+         cs: impl Into<ark_relations::gr1cs::Namespace<F>>,
+         f: impl FnOnce() -> Result<T, SynthesisError>,
+         mode: ark_r1cs_std::alloc::AllocationMode,
+@@ -84,7 +88,7 @@ impl<F: PrimeField> AllocVar<TrainingStepInputs<F>, F> for TrainingStepInputsVar
+         let cs = ns.cs();
+         let inputs = f()?;
+         let inputs = inputs.borrow();
+-        let values: Vec<FpVar<F>> = inputs
++        let values = inputs
+             .values
+             .iter()
+             .map(|v| FpVar::new_variable(cs.clone(), || Ok(*v), mode))
+@@ -94,686 +98,849 @@ impl<F: PrimeField> AllocVar<TrainingStepInputs<F>, F> for TrainingStepInputsVar
+ }
+ 
+ // ============================================================
+-// TrainingStepCircuit — Proof of Linear SGD
++// GradientFingerprintCircuit  (architecture.md Section 2)
+ // ============================================================
+-/// Proves one step of linear SGD training on a single sample.
++/// Model-agnostic IVC circuit — proves gradient commitment AND accumulates L2 norm².
++///
++/// State z = [model_fp, ref_grad_fp, grad_fp_accum, norm_sq_accum, directional_fp_accum, step_count]  (6 elements)
+ ///
+-/// State z = [model_fingerprint, grad_accum, step_count]  (3 elements)
++/// Per step (CHUNK_SIZE = 2048 elements):
++///   g_chunk   = external_inputs[0..CHUNK_SIZE]              (quantized gradient slice)
++///   r_chunk   = external_inputs[CHUNK_SIZE..2*CHUNK_SIZE]   (Fiat-Shamir challenge)
++///   ref_chunk = external_inputs[2*CHUNK_SIZE..3*CHUNK_SIZE] (quantized reference slice)
+ ///
+-/// Per step, the circuit:
+-///   1. MODEL BINDING: computes ⟨r, W||b⟩ and checks == state[0]
+-///      (Schwartz-Zippel: if wrong W used, fails w.p. 1 - 1/|Fr|)
+-///   2. FORWARD PASS: logits_k = Σ_j W[k][j]·x[j] + b[k]
+-///   3. MSE GRADIENT: error_k = logits_k - onehot(y, k)
+-///                    grad_{k,j} = error_k · x[j]
+-///   4. GRADIENT ACCUM: grad_accum' = grad_accum + Σ|grad|
+-///   5. step_count' = step_count + 1
++///   Fingerprint constraint (2048 mul gates):
++///     dot = Σ r_j * g_j  →  grad_fp_accum' = grad_fp_accum + dot
+ ///
+-/// Constraint count: Variable based on dimensions
+-///   - Forward pass: input_dim × num_classes mults
+-///   - Gradient: input_dim × num_classes mults
++///   Norm² accumulation constraint (2048 mul gates):
++///     norm_sq_accum' = norm_sq_accum + Σ g_j²
++///
++///   Directional accumulation constraint (2048 mul gates):
++///     directional_fp_accum' = directional_fp_accum + Σ g_j * ref_j
++///
++/// The final state accumulations are embedded in the IVC proof public output.
++/// The Python server checks: norm_sq_accum ≤ B_l² (EMA-based bound) and directional_fp_accum >= 0.
++/// Clients cannot fake this value without breaking the ZK proof.
+ #[derive(Clone, Debug)]
+-pub struct TrainingStepCircuit<F: PrimeField> {
++pub struct GradientFingerprintCircuit<F: PrimeField> {
+     _f: PhantomData<F>,
+-    pub input_dim: usize,
+-    pub num_classes: usize,
+-    pub sample_size: usize,
+ }
+ 
+-impl<F: PrimeField> FCircuit<F> for TrainingStepCircuit<F> {
+-    type Params = (usize, usize, usize); // (input_dim, num_classes, sample_size)
+-    type ExternalInputs = TrainingStepInputs<F>;
+-    type ExternalInputsVar = TrainingStepInputsVar<F>;
++impl<F: PrimeField> FCircuit<F> for GradientFingerprintCircuit<F> {
++    type Params = ();
++    type ExternalInputs = GradientExternalInputs<F>;
++    type ExternalInputsVar = GradientExternalInputsVar<F>;
+ 
+-    fn new(params: Self::Params) -> Result<Self, Error> {
+-        let (input_dim, num_classes, sample_size) = params;
+-        Ok(Self { 
+-            _f: PhantomData,
+-            input_dim,
+-            num_classes,
+-            sample_size,
+-        })
++    fn new(_params: Self::Params) -> Result<Self, Error> {
++        Ok(Self { _f: PhantomData })
+     }
+ 
+     fn state_len(&self) -> usize {
+-        3 // [model_fingerprint, grad_accum, step_count]
++        7 // [model_fp, ref_grad_fp, grad_fp_accum, norm_sq_accum, directional_fp_accum, ref_fp_accum, step_count]
+     }
+ 
+     fn generate_step_constraints(
+         &self,
+-        cs: ConstraintSystemRef<F>,
+-        i: usize,
++        _cs: ConstraintSystemRef<F>,
++        _i: usize,
+         z_i: Vec<FpVar<F>>,
+         external_inputs: Self::ExternalInputsVar,
+     ) -> Result<Vec<FpVar<F>>, SynthesisError> {
+         let ext = &external_inputs.values;
+ 
+-        // Use dynamic dimensions
+-        let input_dim = self.input_dim;
+-        let num_classes = self.num_classes;
+-        let sample_size = self.sample_size;
+-
+-        // Compute offsets dynamically
+-        let off_x = 0;
+-        let off_y = input_dim;
+-        let off_w = off_y + 1;
+-        let off_b = off_w + (num_classes * input_dim);
+-        let off_r = off_b + num_classes;
+-        let off_w_sampled = off_r + num_classes;
+-
+-        // Unpack state
+-        let model_fingerprint = &z_i[0];
+-        let grad_accum = &z_i[1];
+-        let step_count = &z_i[2];
+-
+-        // Unpack external inputs by offset (dynamic dimensions)
+-        let x = &ext[off_x..off_y];
+-        let y_label = &ext[off_y];
+-        let w_flat = &ext[off_w..off_b];
+-        let b = &ext[off_b..off_r];
+-        let r = &ext[off_r..off_r + num_classes];
+-        let w_sampled = &ext[off_w_sampled..];
+-
+-        // =====================================================
+-        // CONSTRAINT 1: Model Fingerprint
+-        // 
+-        // NOTE: Fingerprint verification moved OUTSIDE the circuit to maintain
+-        // ProtoGalaxy uniformity. The IVC circuit proves computation correctness.
+-        // Byzantine detection happens via external fingerprint comparison after
+-        // proof generation, achieving 100% detection without folding issues.
+-        // =====================================================
+-
+-        // =====================================================
+-        // CONSTRAINT 2: Forward pass — logits = W·x + b
+-        // For each class k: logit_k = Σ_{j} W[k*input_dim+j] * x[j] + b[k]
+-        // =====================================================
+-        let mut logits = Vec::with_capacity(num_classes);
+-        for k in 0..num_classes {
+-            let mut logit_k = b[k].clone();
+-            for j in 0..input_dim {
+-                // W[k,j] * x[j] — multiplication constraint
+-                let prod = &w_flat[k * input_dim + j] * &x[j];
+-                logit_k = &logit_k + &prod;
+-            }
+-            logits.push(logit_k);
++        let model_fp             = &z_i[0];
++        let ref_grad_fp          = &z_i[1];
++        let grad_fp_accum        = &z_i[2];
++        let norm_sq_accum        = &z_i[3];
++        let directional_fp_accum = &z_i[4];
++        let ref_fp_accum         = &z_i[5];
++        let step_count           = &z_i[6];
++
++        // Unpack external inputs: [g_chunk | r_chunk | ref_chunk]
++        let g_chunk   = &ext[0..CHUNK_SIZE];
++        let r_chunk   = &ext[CHUNK_SIZE..2 * CHUNK_SIZE];
++        let ref_chunk = &ext[2 * CHUNK_SIZE..3 * CHUNK_SIZE];
++
++        // === CONSTRAINTS ===
++        let mut dot = FpVar::zero();
++        let mut norm_sq_delta = FpVar::zero();
++        let mut directional_delta = FpVar::zero();
++        let mut ref_fp_delta = FpVar::zero();
++        for j in 0..CHUNK_SIZE {
++            // Fingerprint term: r_j * g_j
++            let r_times_g = &r_chunk[j] * &g_chunk[j];
++            dot = &dot + &r_times_g;
++
++            // Norm² term: g_j * g_j
++            let g_squared = &g_chunk[j] * &g_chunk[j];
++            norm_sq_delta = &norm_sq_delta + &g_squared;
++
++            // Directional term: g_j * ref_j
++            let g_times_ref = &g_chunk[j] * &ref_chunk[j];
++            directional_delta = &directional_delta + &g_times_ref;
++
++            // Reference fingerprint spoof prevention term: r_j * ref_j
++            let r_times_ref = &r_chunk[j] * &ref_chunk[j];
++            ref_fp_delta = &ref_fp_delta + &r_times_ref;
+         }
+ 
+-        // =====================================================
+-        // CONSTRAINT 3: MSE gradient
+-        // error_k = logit_k - onehot(y, k)
+-        // For MSE: ∂L/∂W[k,j] = error_k * x[j]
+-        // =====================================================
+-        // Build one-hot target using Lagrange indicator polynomials (IVC-compatible)
+-        // target[k] = Π_{m≠k} (y-m) / Π_{m≠k} (k-m)
+-        //
+-        // This is DETERMINISTIC field arithmetic (no witness allocation)
+-        // Therefore IVC-compatible: no cross-step witness conflicts
+-        //
+-        // Compute Lagrange denominators dynamically
+-        // denom[k] = Π_{m=0,m≠k}^{num_classes-1} (k-m)
+-        let mut lagrange_denoms = Vec::with_capacity(num_classes);
+-        for k in 0..num_classes {
+-            let mut denom: i64 = 1;
+-            for m in 0..num_classes {
+-                if m != k {
+-                    denom *= (k as i64 - m as i64);
+-                }
+-            }
+-            lagrange_denoms.push(denom);
+-        }
+-        
+-        let one = FpVar::one();
+-        let mut targets = Vec::with_capacity(num_classes);
+-        
+-        for k in 0..num_classes {
+-            // Compute numerator: Π_{m≠k} (y - m)
+-            let mut numerator = one.clone();
+-            for m in 0..num_classes {
+-                if m != k {
+-                    let m_val = FpVar::new_constant(cs.clone(), F::from(m as u64))?;
+-                    let factor = y_label - &m_val;
+-                    numerator = &numerator * &factor;
+-                }
+-            }
+-            
+-            // Compute denominator inverse (constant)
+-            let denom = lagrange_denoms[k];
+-            let denom_field = if denom >= 0 {
+-                F::from(denom as u64)
+-            } else {
+-                -F::from((-denom) as u64)
+-            };
+-            let denom_inv = denom_field.inverse().unwrap();
+-            let denom_inv_var = FpVar::new_constant(cs.clone(), denom_inv)?;
+-            
+-            // target_k = numerator / denominator (deterministic, no witness)
+-            let target_k = &numerator * &denom_inv_var;
+-            targets.push(target_k);
+-        }
+-        
+-        // No additional constraints needed - Lagrange property guarantees:
+-        // - target[k] = 1 when y = k
+-        // - target[k] = 0 when y = m (m ≠ k)
+-        // - Σ target[k] = 1 for all y ∈ {0..9}
+-
+-        // Compute errors and gradient contribution
+-        let mut grad_contribution = FpVar::zero();
+-        for k in 0..num_classes {
+-            let error_k = &logits[k] - &targets[k];
+-            // MSE contribution: error_k^2
+-            let err_sq = &error_k * &error_k;
+-            grad_contribution = &grad_contribution + &err_sq;
+-        }
++        // === STATE TRANSITION ===
++        let new_grad_fp_accum        = grad_fp_accum + &dot;
++        let new_norm_sq_accum        = norm_sq_accum + &norm_sq_delta;
++        let new_directional_fp_accum = directional_fp_accum + &directional_delta;
++        let new_ref_fp_accum         = ref_fp_accum + &ref_fp_delta;
++        let new_step_count           = step_count + &FpVar::one();
+ 
+-        // =====================================================
+-        // STATE TRANSITION
+-        // Always return the ORIGINAL state[0] (model_fingerprint), not
+-        // fp_computed. They are constrained equal above, but using the
+-        // witness-derived fp_computed would break the IVC folding chain
+-        // (the committed state must not depend transitively on witnesses).
+-        // =====================================================
+-        let new_grad_accum = grad_accum + &grad_contribution;
+-        let new_step_count = step_count + &one;
+-        
++        // model_fp and ref_grad_fp passthrough
+         Ok(vec![
+-            model_fingerprint.clone(), // carry forward the committed fingerprint
+-            new_grad_accum,             // accumulated MSE loss
+-            new_step_count,             // step counter
++            model_fp.clone(),
++            ref_grad_fp.clone(),
++            new_grad_fp_accum,
++            new_norm_sq_accum,
++            new_directional_fp_accum,
++            new_ref_fp_accum,
++            new_step_count,
+         ])
+     }
+ }
+ 
+ // ============================================================
+-// Legacy circuits (kept for backward compatibility)
++// Type aliases for the ProtoGalaxy instantiation
+ // ============================================================
+-
+-/// Addition circuit with norm bounds (legacy)
+-#[derive(Clone, Copy, Debug)]
+-pub struct BoundedAdditionFCircuit<F: PrimeField> {
+-    _f: PhantomData<F>,
++/// KZG on BN254 is required for Sonobe's ProtoGalaxy `DeciderEth` (Groth16) final layer.
++type CS1 = KZG<'static, Bn254>;
++type CS2 = Pedersen<G2>;
++type PGFC = GradientFingerprintCircuit<Fr>;
++type PGGrad = ProtoGalaxy<G1, G2, PGFC, CS1, CS2>;
++type PGGradIVCProof = IVCProof<G1, G2>;
++type PGDec = ProtoGalaxyDeciderEth<G1, G2, PGFC, CS1, CS2, Groth16<Bn254>, PGGrad>;
++type PgProverParams = folding_schemes::folding::protogalaxy::ProverParams<G1, G2, CS1, CS2>;
++type PgVerifierParams = folding_schemes::folding::protogalaxy::VerifierParams<G1, G2, CS1, CS2>;
++type DecProverParams = <PGDec as DeciderTrait<G1, G2, PGFC, PGGrad>>::ProverParam;
++type DecVerifierParams = <PGDec as DeciderTrait<G1, G2, PGFC, PGGrad>>::VerifierParam;
++type DecProof = <PGDec as DeciderTrait<G1, G2, PGFC, PGGrad>>::Proof;
++
++/// Decider-finalized bundle (Groth16 + KZG openings): **O(1)** verifier work in IVC length.
++const DEC_MAGIC: &[u8; 4] = b"PGD1";
++const DEC_VERSION: u8 = 1;
++
++/// Batch envelope for multiple **independent** client bundles (each in standard wire format).
++/// ProtoGalaxy IVC does not merge unrelated client proofs into one succinct proof without a
++/// dedicated outer recursive circuit; this format packs N verified bundles so a verifier runs
++/// `PGGrad::verify` on each (O(N) crypto).
++const BATCH_MAGIC: &[u8; 4] = b"PGFB";
++const BATCH_VERSION: u8 = 1;
++
++/// Verifies one client bundle: `[chunk_size u32][proof_len u32][ivc proof][vp bytes]`.
++fn verify_standard_client_bundle_bytes(bundle: &[u8]) -> Result<(), String> {
++    if bundle.len() < 8 {
++        return Err("bundle too short".into());
++    }
++    let chunk_size_in_bundle = u32::from_le_bytes(bundle[0..4].try_into().unwrap()) as usize;
++    if chunk_size_in_bundle != CHUNK_SIZE {
++        return Err(format!(
++            "chunk_size {} != compiled CHUNK_SIZE {}",
++            chunk_size_in_bundle, CHUNK_SIZE
++        ));
++    }
++    let proof_len = u32::from_le_bytes(bundle[4..8].try_into().unwrap()) as usize;
++    if bundle.len() < 8 + proof_len {
++        return Err("bundle truncated (proof)".into());
++    }
++    let proof_bytes_slice = &bundle[8..8 + proof_len];
++    let vp_bytes_slice = &bundle[8 + proof_len..];
++
++    let ivc_proof = PGGradIVCProof::deserialize_compressed(proof_bytes_slice)
++        .map_err(|e| format!("IVC proof deserialize: {:?}", e))?;
++
++    let final_state = ivc_proof.z_i.clone();
++    if final_state.len() < 7 {
++        return Err("IVC state vector too short".into());
++    }
++    let ref_fp_accum_str = format!("{}", final_state[5].into_bigint());
++    let expected_ref_fp_str = format!("{}", ivc_proof.z_0[1].into_bigint());
++    if ref_fp_accum_str != expected_ref_fp_str {
++        return Err(format!(
++            "reference fingerprint mismatch (accum {} vs z_0[1] {})",
++            ref_fp_accum_str, expected_ref_fp_str
++        ));
++    }
++
++    let vp = PGGrad::vp_deserialize_with_mode(
++        vp_bytes_slice,
++        Compress::Yes,
++        Validate::Yes,
++        (),
++    )
++    .map_err(|e| format!("VerifierParams: {:?}", e))?;
++
++    PGGrad::verify(vp, ivc_proof).map_err(|e| format!("PG::verify: {:?}", e))?;
++    Ok(())
+ }
+ 
+-impl<F: PrimeField> FCircuit<F> for BoundedAdditionFCircuit<F> {
+-    type Params = ();
+-    type ExternalInputs = [F; 2];
+-    type ExternalInputsVar = [FpVar<F>; 2];
+-
+-    fn new(_params: Self::Params) -> Result<Self, Error> {
+-        Ok(Self { _f: PhantomData })
++fn encode_proof_batches(sub_bundles: &[Vec<u8>]) -> Vec<u8> {
++    let mut out = Vec::new();
++    out.extend_from_slice(BATCH_MAGIC);
++    out.push(BATCH_VERSION);
++    out.extend_from_slice(&[0u8; 3]);
++    out.extend_from_slice(&(sub_bundles.len() as u32).to_le_bytes());
++    for b in sub_bundles {
++        let len = b.len();
++        if len > u32::MAX as usize {
++            panic!("single bundle length overflow");
++        }
++        out.extend_from_slice(&(len as u32).to_le_bytes());
++        out.extend_from_slice(b);
+     }
++    out
++}
+ 
+-    fn state_len(&self) -> usize {
+-        1
++fn decode_and_verify_batch_bundle(batch: &[u8]) -> Result<usize, String> {
++    if batch.len() < 12 {
++        return Err("batch too short".into());
++    }
++    if &batch[0..4] != BATCH_MAGIC {
++        return Err("missing PGFB magic (not a batch bundle)".into());
++    }
++    if batch[4] != BATCH_VERSION {
++        return Err(format!("unsupported batch version {}", batch[4]));
++    }
++    let count = u32::from_le_bytes(batch[8..12].try_into().unwrap()) as usize;
++    let mut offset = 12usize;
++    for i in 0..count {
++        if offset + 4 > batch.len() {
++            return Err(format!("truncated batch entry {} (length)", i));
++        }
++        let slen = u32::from_le_bytes(batch[offset..offset + 4].try_into().unwrap()) as usize;
++        offset += 4;
++        if offset + slen > batch.len() {
++            return Err(format!("truncated batch entry {} (payload)", i));
++        }
++        let sub = &batch[offset..offset + slen];
++        verify_any_client_bundle_bytes(sub)
++            .map_err(|e| format!("sub-bundle {}: {}", i, e))?;
++        offset += slen;
+     }
++    if offset != batch.len() {
++        return Err("trailing bytes after batch".into());
++    }
++    Ok(count)
++}
+ 
+-    fn generate_step_constraints(
+-        &self,
+-        _cs: ConstraintSystemRef<F>,
+-        _i: usize,
+-        z_i: Vec<FpVar<F>>,
+-        external_inputs: Self::ExternalInputsVar,
+-    ) -> Result<Vec<FpVar<F>>, SynthesisError> {
+-        let gradient_sum = &external_inputs[0];
+-        let max_norm_squared = &external_inputs[1];
+-        let z_next = &z_i[0] + gradient_sum;
+-        let sum_squared = gradient_sum * gradient_sum;
+-        let difference = max_norm_squared - &sum_squared;
+-        let reconstructed = &sum_squared + &difference;
+-        reconstructed.enforce_equal(max_norm_squared)?;
+-        Ok(vec![z_next])
++fn push_len_bytes(buf: &mut Vec<u8>, data: &[u8]) {
++    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
++    buf.extend_from_slice(data);
++}
++
++fn pop_len_bytes<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
++    if *offset + 4 > bytes.len() {
++        return Err("truncated length prefix".into());
+     }
++    let n = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) as usize;
++    *offset += 4;
++    if *offset + n > bytes.len() {
++        return Err("truncated payload".into());
++    }
++    let slice = &bytes[*offset..*offset + n];
++    *offset += n;
++    Ok(slice)
+ }
+ 
+-/// Legacy circuit (no bounds)
+-#[derive(Clone, Copy, Debug)]
+-pub struct AdditionFCircuit<F: PrimeField> {
+-    _f: PhantomData<F>,
++fn push_fr_vec(buf: &mut Vec<u8>, v: &[Fr]) {
++    buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
++    for fr in v {
++        let mut t = Vec::new();
++        fr.serialize_compressed(&mut t)
++            .expect("Fr serialize");
++        push_len_bytes(buf, &t);
++    }
+ }
+ 
+-impl<F: PrimeField> FCircuit<F> for AdditionFCircuit<F> {
+-    type Params = ();
+-    type ExternalInputs = [F; 1];
+-    type ExternalInputsVar = [FpVar<F>; 1];
++fn pop_fr_vec(bytes: &[u8], offset: &mut usize) -> Result<Vec<Fr>, String> {
++    if *offset + 4 > bytes.len() {
++        return Err("truncated Fr vec count".into());
++    }
++    let n = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) as usize;
++    *offset += 4;
++    let mut out = Vec::with_capacity(n);
++    for _ in 0..n {
++        let blob = pop_len_bytes(bytes, offset)?;
++        let fr = Fr::deserialize_compressed(blob)
++            .map_err(|e| format!("Fr deserialize: {:?}", e))?;
++        out.push(fr);
++    }
++    Ok(out)
++}
+ 
+-    fn new(_params: Self::Params) -> Result<Self, Error> {
+-        Ok(Self { _f: PhantomData })
++fn push_g1_vec(buf: &mut Vec<u8>, v: &[G1]) {
++    buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
++    for p in v {
++        let mut t = Vec::new();
++        p.into_affine()
++            .serialize_compressed(&mut t)
++            .expect("G1 serialize");
++        push_len_bytes(buf, &t);
+     }
++}
+ 
+-    fn state_len(&self) -> usize {
+-        1
++fn pop_g1_vec(bytes: &[u8], offset: &mut usize) -> Result<Vec<G1>, String> {
++    if *offset + 4 > bytes.len() {
++        return Err("truncated G1 vec count".into());
++    }
++    let n = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) as usize;
++    *offset += 4;
++    let mut out = Vec::with_capacity(n);
++    for _ in 0..n {
++        let blob = pop_len_bytes(bytes, offset)?;
++        let aff = G1Affine::deserialize_compressed(blob)
++            .map_err(|e| format!("G1 deserialize: {:?}", e))?;
++        out.push(aff.into());
+     }
++    Ok(out)
++}
+ 
+-    fn generate_step_constraints(
+-        &self,
+-        _cs: ConstraintSystemRef<F>,
+-        _i: usize,
+-        z_i: Vec<FpVar<F>>,
+-        external_inputs: Self::ExternalInputsVar,
+-    ) -> Result<Vec<FpVar<F>>, SynthesisError> {
+-        let z_next = &z_i[0] + &external_inputs[0];
+-        Ok(vec![z_next])
++fn parse_decider_bundle(
++    bytes: &[u8],
++) -> Result<
++    (
++        DecProof,
++        DecVerifierParams,
++        Fr,
++        Vec<Fr>,
++        Vec<Fr>,
++        Vec<G1>,
++        Vec<G1>,
++    ),
++    String,
++> {
++    if bytes.len() < 16 {
++        return Err("decider bundle too short".into());
++    }
++    if &bytes[0..4] != DEC_MAGIC {
++        return Err("not a decider bundle".into());
++    }
++    if bytes[4] != DEC_VERSION {
++        return Err(format!("unsupported decider version {}", bytes[4]));
++    }
++    let mut off = 8usize;
++    let chunk = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
++    off += 4;
++    if chunk != CHUNK_SIZE {
++        return Err(format!("chunk marker {} != {}", chunk, CHUNK_SIZE));
++    }
++    let proof_blob = pop_len_bytes(bytes, &mut off)?;
++    let dec_proof = DecProof::deserialize_compressed(proof_blob)
++        .map_err(|e| format!("Decider proof: {:?}", e))?;
++    let vp_blob = pop_len_bytes(bytes, &mut off)?;
++    let dec_vp = DecVerifierParams::deserialize_compressed(vp_blob)
++        .map_err(|e| format!("Decider vp: {:?}", e))?;
++    let i_blob = pop_len_bytes(bytes, &mut off)?;
++    let i = Fr::deserialize_compressed(i_blob).map_err(|e| format!("i: {:?}", e))?;
++    let z_0 = pop_fr_vec(bytes, &mut off)?;
++    let z_i = pop_fr_vec(bytes, &mut off)?;
++    let run_c = pop_g1_vec(bytes, &mut off)?;
++    let inc_c = pop_g1_vec(bytes, &mut off)?;
++    if off != bytes.len() {
++        return Err("trailing bytes in decider bundle".into());
++    }
++    Ok((dec_proof, dec_vp, i, z_0, z_i, run_c, inc_c))
++}
++
++fn verify_decider_bundle_crypto(bytes: &[u8]) -> Result<(String, String), String> {
++    let (dec_proof, dec_vp, i, z_0, z_i, run_c, inc_c) = parse_decider_bundle(bytes)?;
++    if z_i.len() < 7 || z_0.len() < 7 {
++        return Err("z_i / z_0 too short".into());
++    }
++    let norm_sq_str = format!("{:?}", z_i[3]);
++    let dir_fp_str = format!("{:?}", z_i[4]);
++    let ref_fp_accum_str = format!("{}", z_i[5].into_bigint());
++    let expected_ref_fp_str = format!("{}", z_0[1].into_bigint());
++    if ref_fp_accum_str != expected_ref_fp_str {
++        return Err(format!(
++            "reference fingerprint mismatch (accum {} vs z_0[1] {})",
++            ref_fp_accum_str, expected_ref_fp_str
++        ));
++    }
++    let ok = PGDec::verify(dec_vp, i, z_0, z_i, &run_c, &inc_c, &dec_proof)
++        .map_err(|e| format!("Decider verify: {:?}", e))?;
++    if !ok {
++        return Err("Decider verify returned false".into());
++    }
++    Ok((norm_sq_str, dir_fp_str))
++}
++
++fn verify_any_client_bundle_bytes(b: &[u8]) -> Result<(), String> {
++    if b.len() >= 4 && &b[0..4] == DEC_MAGIC {
++        verify_decider_bundle_crypto(b).map(|_| ())
++    } else {
++        verify_standard_client_bundle_bytes(b)
+     }
+ }
+ 
+ // ============================================================
+-// Python-facing Proof-of-Training Prover (ProtoGalaxy IVC)
++// GradientZKProver — Python-facing proof-of-gradient prover
+ // ============================================================
+-
+-/// Uses ProtoGalaxy folding scheme with TrainingStepCircuit.
+-/// Each IVC step proves one training sample.
++/// Generates and verifies ZK proofs that gradient chunks match a committed fingerprint.
++///
++/// Usage (prover side):
++///   prover = GradientZKProver()
++///   prover.initialize(model_fp)
++///   for chunk in gradient_chunks:
++///       prover.prove_chunk(g_chunk, r_chunk)
++///   bundle = prover.generate_proof_bundle()   # bytes to send to server
++///
++/// Usage (verifier side — server):
++///   ok = GradientZKProver.verify_proof_bundle_static(bundle)
++///   # Returns True only if PG::verify passes (real cryptographic check)
+ #[pyclass]
+-pub struct FLTrainingProver {
+-    protogalaxy: Option<ProtoGalaxy<G1, G2, TrainingStepCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>>,
++pub struct GradientZKProver {
++    protogalaxy: Option<PGGrad>,
++    pg_params: Option<(PgProverParams, PgVerifierParams)>,
++    decider_pp: Option<DecProverParams>,
++    decider_vp: Option<DecVerifierParams>,
++    vp_serialized: Vec<u8>, // serialized cs_vp + cf_cs_vp (IVC / compatibility)
+     num_steps: usize,
+-    
+-    // Fingerprint data for Decider SNARK (Byzantine detection)
+-    model_fingerprint: Option<i64>,
+-    sampled_weights: Option<Vec<f64>>,
+-    biases: Option<Vec<f64>>,
+-    random_vector: Option<Vec<f64>>,
+-    
+-    // Groth16 proving key for Decider (cached after first setup)
+-    decider_pk: Option<ark_groth16::ProvingKey<Bn254>>,
+-    
+-    // Model dimensions (configurable)
+-    input_dim: usize,
+-    num_classes: usize,
+-    sample_size: usize,
++    model_fp: i64,
++    ref_grad_fp: i64,
+ }
+ 
+-type PGTraining = ProtoGalaxy<G1, G2, TrainingStepCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>;
+-
+ #[pymethods]
+-impl FLTrainingProver {
++impl GradientZKProver {
+     #[new]
+     fn new() -> Self {
+-        FLTrainingProver {
++        GradientZKProver {
+             protogalaxy: None,
++            pg_params: None,
++            decider_pp: None,
++            decider_vp: None,
++            vp_serialized: Vec::new(),
+             num_steps: 0,
+-            model_fingerprint: None,
+-            sampled_weights: None,
+-            biases: None,
+-            random_vector: None,
+-            decider_pk: None,
+-            input_dim: INPUT_DIM,
+-            num_classes: NUM_CLASSES,
+-            sample_size: SAMPLE_SIZE,
++            model_fp: 0,
++            ref_grad_fp: 0,
+         }
+     }
+ 
+-    /// Store fingerprint data for Byzantine detection in Decider SNARK
+-    fn set_fingerprint_data(
+-        &mut self,
+-        fingerprint: i64,
+-        sampled_weights: Vec<f64>,
+-        biases: Vec<f64>,
+-        random_vector: Vec<f64>,
+-    ) -> PyResult<()> {
+-        self.model_fingerprint = Some(fingerprint);
+-        self.sampled_weights = Some(sampled_weights);
+-        self.biases = Some(biases);
+-        self.random_vector = Some(random_vector);
+-        Ok(())
+-    }
+-    
+-    /// Setup Groth16 proving key for Decider (expensive, ~10-30s, done once)
+-    /// This must be called before generate_final_proof if Decider proofs are needed
+-    fn setup_decider(&mut self) -> PyResult<String> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                "Prover not initialized. Call initialize() first."
+-            ))?;
+-            
+-        // Create dummy Decider circuit for setup (without fingerprint data)
+-        let dummy_circuit = DeciderEthCircuit::<G1, G2>::try_from(protogalaxy.clone())
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                format!("Failed to create dummy Decider circuit: {:?}", e)
+-            ))?;
+-        
+-        // Run Groth16 circuit-specific setup
+-        let mut rng = ark_std::rand::rngs::OsRng;
+-        let (pk, _vk) = Groth16::<Bn254>::circuit_specific_setup(dummy_circuit, &mut rng)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                format!("Groth16 setup failed: {:?}", e)
+-            ))?;
+-        
+-        // Cache the proving key
+-        self.decider_pk = Some(pk);
+-        
+-        Ok("Decider Groth16 setup complete. Proving key cached.".to_string())
+-    }
+-
+-    /// Initialize the ProtoGalaxy IVC prover with initial state [fingerprint, 0, 0, 0].
++    /// Initialize the IVC prover with a committed model fingerprint.
+     ///
+-    /// Args:
+-    ///   fingerprint: Integer model fingerprint (i64-compatible, computed in Python)
+-    fn initialize(&mut self, fingerprint: i64, input_dim: Option<usize>, num_classes: Option<usize>, sample_size: Option<usize>) -> PyResult<String> {
+-        // Use provided dimensions or defaults
+-        self.input_dim = input_dim.unwrap_or(INPUT_DIM);
+-        self.num_classes = num_classes.unwrap_or(NUM_CLASSES);
+-        self.sample_size = sample_size.unwrap_or(SAMPLE_SIZE);
+-        
+-        let fp_field = Fr::from(fingerprint as u64);
+-        let f_circuit = TrainingStepCircuit::<Fr>::new((self.input_dim, self.num_classes, self.sample_size))
++    /// model_fp: integer fingerprint of the global model
++    /// ref_grad_fp: integer fingerprint of the reference public gradient
++    ///
++    /// This runs ProtoGalaxy::preprocess (expensive ~10-60s depending on hardware).
++    fn initialize(&mut self, model_fp: i64, ref_grad_fp: i64) -> PyResult<String> {
++        self.model_fp = model_fp;
++        self.ref_grad_fp = ref_grad_fp;
++        let fp_field = int_to_field(model_fp);
++        let ref_fp_field = int_to_field(ref_grad_fp);
++        let f_circuit = GradientFingerprintCircuit::<Fr>::new(())
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+ 
+         let mut rng = ark_std::rand::rngs::OsRng;
+         let poseidon_config = poseidon_canonical_config::<Fr>();
+-        let pg_params = PGTraining::preprocess(&mut rng, &(poseidon_config, f_circuit.clone()))
++        let pg_params = PGGrad::preprocess(&mut rng, &(poseidon_config, f_circuit.clone()))
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+ 
+-        let z_0 = vec![fp_field, Fr::zero(), Fr::zero()];  // [fingerprint, grad=0, step=0]
+-
+-        let protogalaxy = PGTraining::init(&pg_params, f_circuit, z_0)
++        let state_len = f_circuit.state_len();
++        let (decider_pp, decider_vp) = PGDec::preprocess(&mut rng, (pg_params.clone(), state_len))
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Decider preprocess: {:?}", e)))?;
++        self.decider_pp = Some(decider_pp);
++        self.decider_vp = Some(decider_vp);
++
++        // Serialize vp (only cs_vp + cf_cs_vp) for the proof bundle
++        let mut vp_bytes = Vec::new();
++        pg_params.1.cs_vp.serialize_compressed(&mut vp_bytes)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("VP serialize: {:?}", e)))?;
++        pg_params.1.cf_cs_vp.serialize_compressed(&mut vp_bytes)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("CF-VP serialize: {:?}", e)))?;
++        self.vp_serialized = vp_bytes;
++
++        // 7-element initial state
++        let z_0 = vec![fp_field, ref_fp_field, Fr::zero(), Fr::zero(), Fr::zero(), Fr::zero(), Fr::zero()];
++        let protogalaxy = PGGrad::init(&pg_params, f_circuit, z_0)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+ 
+         self.protogalaxy = Some(protogalaxy);
++        self.pg_params = Some(pg_params);
+         self.num_steps = 0;
+ 
+-        Ok("Training proof system initialized (ProtoGalaxy PoT)".to_string())
++        Ok(format!(
++            "GradientZKProver initialized (ProtoGalaxy+KZG + DeciderEth). model_fp={}, ref_grad_fp={}, chunk_size={}",
++            model_fp, ref_grad_fp, CHUNK_SIZE
++        ))
+     }
+ 
+-    /// Prove one training step on sample (x, y) with model (w_flat, b) and random vector r.
++    /// Prove one chunk of gradient elements.
++    ///
++    /// g_chunk: CHUNK_SIZE gradient values (float64, scaled internally)
++    /// r_chunk: CHUNK_SIZE random challenge values (float64, from server Fiat-Shamir)
++    /// ref_chunk: CHUNK_SIZE reference public values (float64, scaled internally)
+     ///
+-    /// Args:
+-    ///   x: Vec<f64> of length 784 (pixel values)
+-    ///   y: integer label (0..9) as f64
+-    ///   w_flat: Vec<f64> of length 7840 (row-major weights, for forward pass)
+-    ///   b: Vec<f64> of length 10 (biases)
+-    ///   r: Vec<f64> of length 10 (random fingerprint vector)
+-    ///   w_sampled: Vec<f64> of length 1000 (sampled weights for fingerprint)
+-    fn prove_training_step(
+-        &mut self,
+-        x: Vec<f64>,
+-        y: f64,
+-        w_flat: Vec<f64>,
+-        b: Vec<f64>,
+-        r: Vec<f64>,
+-        w_sampled: Vec<f64>,
+-    ) -> PyResult<String> {
++    /// This appends one IVC step. The circuit computes dot = <r_chunk, g_chunk>
++    /// and accumulates it into grad_fp_accum.
++    fn prove_chunk(&mut self, g_chunk: Vec<i64>, r_chunk: Vec<i64>, ref_chunk: Vec<i64>) -> PyResult<String> {
++        if g_chunk.len() != CHUNK_SIZE {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
++                format!("g_chunk must have {} elements, got {}", CHUNK_SIZE, g_chunk.len())
++            ));
++        }
++        if r_chunk.len() != CHUNK_SIZE {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
++                format!("r_chunk must have {} elements, got {}", CHUNK_SIZE, r_chunk.len())
++            ));
++        }
++        if ref_chunk.len() != CHUNK_SIZE {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
++                format!("ref_chunk must have {} elements, got {}", CHUNK_SIZE, ref_chunk.len())
++            ));
++        }
++
+         let protogalaxy = self.protogalaxy.as_mut()
+             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                 "Not initialized. Call initialize() first."
+             ))?;
+ 
+-        // Validate dimensions
+-        if x.len() != self.input_dim {
+-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+-                format!("x must have {} elements, got {}", self.input_dim, x.len())
+-            ));
++        let mut ext_values = Vec::with_capacity(3 * CHUNK_SIZE);
++        for &v in g_chunk.iter() {
++            ext_values.push(int_to_field(v));
+         }
+-        if w_sampled.len() != self.num_classes * self.sample_size {
+-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+-                format!("w_sampled must have {} elements, got {}", self.num_classes * self.sample_size, w_sampled.len())
+-            ));
++        for &v in r_chunk.iter() {
++            ext_values.push(int_to_field(v));
++        }
++        for &v in ref_chunk.iter() {
++            ext_values.push(int_to_field(v));
+         }
+ 
++        let ext_inputs = GradientExternalInputs { values: ext_values };
+         let mut rng = ark_std::rand::rngs::OsRng;
+ 
+-        // Build external inputs vector
+-        // NOTE: y pushed as raw integer Fr::from(y as u64) NOT float-scaled,
+-        // because circuit compares against Fr::from(k as u64).
+-        // Calculate length dynamically based on actual dimensions
+-        let ext_len = self.input_dim + 1 + (self.num_classes * self.input_dim) + 
+-                      self.num_classes + self.num_classes + (self.num_classes * self.sample_size);
+-        let mut ext_values = Vec::with_capacity(ext_len);
+-        for &v in x.iter()    { ext_values.push(float_to_field(v)); }
+-        ext_values.push(Fr::from(y as u64));               // raw integer label 0..9
+-        for &v in w_flat.iter() { ext_values.push(float_to_field(v)); }
+-        for &v in b.iter()    { ext_values.push(float_to_field(v)); }
+-        for &v in r.iter()    { ext_values.push(float_to_field(v)); }
+-        for &v in w_sampled.iter() { ext_values.push(float_to_field(v)); } // Sampled weights for fingerprint
+-
+-        let ext_inputs = TrainingStepInputs { values: ext_values };
+-
+         protogalaxy.prove_step(&mut rng, ext_inputs, None)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                format!("Proof generation failed: {:?}", e)
++                format!("IVC prove_step failed at chunk {}: {:?}", self.num_steps, e)
+             ))?;
+ 
+         self.num_steps += 1;
++        Ok(format!("Chunk {} proven. grad_fp_accum updated.", self.num_steps))
++    }
++
++    /// Generate a self-contained proof bundle that can be verified by any party.
++    ///
++    /// **Decider bundle (preferred, `PGD1` magic)** after at least two `prove_chunk` calls:
++    /// Groth16 + KZG decider over the finished ProtoGalaxy IVC — verifier work is **O(1)** in the
++    /// number of folding steps (IVC proof size), at the cost of heavier prover time. After a
++    /// successful decider bundle, the internal IVC state is consumed; call `initialize` again for
++    /// a new proof chain.
++    ///
++    /// **Legacy IVC bundle** when only one step was proven: Sonobe's `DeciderEth::verify` requires
++    /// `i > 1`, so we fall back to embedding the raw IVC proof:
++    /// `[4B: CHUNK_SIZE][4B: proof_len][ivc_proof][vp bytes]`.
++    fn generate_proof_bundle(&mut self) -> PyResult<Vec<u8>> {
++        self.protogalaxy.as_ref().ok_or_else(|| {
++            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                "Not initialized. Call initialize() first.",
++            )
++        })?;
++
++        if self.num_steps == 0 {
++            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                "No steps proven yet. Call prove_chunk() at least once.",
++            ));
++        }
+ 
+-        Ok(format!("Training step proven. Steps completed: {}", self.num_steps))
++        if self.num_steps >= 2 {
++            let dec_pp = self
++                .decider_pp
++                .as_ref()
++                .ok_or_else(|| {
++                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                        "Decider params missing after initialize()",
++                    )
++                })?
++                .clone();
++            let pg_backup = self.protogalaxy.as_ref().unwrap().clone();
++            let pg = self.protogalaxy.take().ok_or_else(|| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("internal: protogalaxy")
++            })?;
++            let i = pg.i;
++            let z_0 = pg.z_0.clone();
++            let z_i = pg.z_i.clone();
++            let run_c = pg.U_i.get_commitments();
++            let inc_c = pg.u_i.get_commitments();
++            let mut rng = ark_std::rand::rngs::OsRng;
++            let dec_proof = match PGDec::prove(&mut rng, dec_pp, pg) {
++                Ok(p) => p,
++                Err(e) => {
++                    self.protogalaxy = Some(pg_backup);
++                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
++                        "Decider prove: {:?}",
++                        e
++                    )));
++                }
++            };
++            let dec_vp = self.decider_vp.as_ref().ok_or_else(|| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Decider vp missing")
++            })?;
++
++            let mut out = Vec::new();
++            out.extend_from_slice(DEC_MAGIC);
++            out.push(DEC_VERSION);
++            out.extend_from_slice(&[0u8; 3]);
++            out.extend_from_slice(&(CHUNK_SIZE as u32).to_le_bytes());
++
++            let mut dp = Vec::new();
++            dec_proof.serialize_compressed(&mut dp).map_err(|e| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
++                    "decider proof serialize: {:?}",
++                    e
++                ))
++            })?;
++            push_len_bytes(&mut out, &dp);
++
++            let mut dv = Vec::new();
++            dec_vp.serialize_compressed(&mut dv).map_err(|e| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
++                    "decider vp serialize: {:?}",
++                    e
++                ))
++            })?;
++            push_len_bytes(&mut out, &dv);
++
++            let mut i_ser = Vec::new();
++            i.serialize_compressed(&mut i_ser).map_err(|e| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("i serialize: {:?}", e))
++            })?;
++            push_len_bytes(&mut out, &i_ser);
++
++            push_fr_vec(&mut out, &z_0);
++            push_fr_vec(&mut out, &z_i);
++            push_g1_vec(&mut out, &run_c);
++            push_g1_vec(&mut out, &inc_c);
++
++            Ok(out)
++        } else {
++            let protogalaxy = self.protogalaxy.as_ref().unwrap();
++            let ivc_proof = protogalaxy.ivc_proof();
++            let mut proof_bytes = Vec::new();
++            ivc_proof.serialize_compressed(&mut proof_bytes).map_err(|e| {
++                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
++                    "IVC proof serialize: {:?}",
++                    e
++                ))
++            })?;
++
++            let mut bundle = Vec::new();
++            bundle.extend_from_slice(&(CHUNK_SIZE as u32).to_le_bytes());
++            bundle.extend_from_slice(&(proof_bytes.len() as u32).to_le_bytes());
++            bundle.extend_from_slice(&proof_bytes);
++            bundle.extend_from_slice(&self.vp_serialized);
++
++            Ok(bundle)
++        }
+     }
+ 
+-    /// Generate final IVC proof (fingerprint already verified in step 0)
+-    fn generate_final_proof(&mut self) -> PyResult<Vec<u8>> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                "Prover not initialized. Call initialize() first."
+-            ))?;
++    /// Verify a proof bundle using the stored VerifierParams (same process).
++    ///
++    /// Deserializes the IVC proof from the bundle, then calls PG::verify(vp, ivc_proof).
++    /// This is a REAL cryptographic verification — not a re-proof.
++    fn verify_proof_bundle(&self, bundle: Vec<u8>) -> PyResult<bool> {
++        if bundle.len() >= 4 && &bundle[0..4] == DEC_MAGIC {
++            return verify_decider_bundle_crypto(&bundle)
++                .map(|_| true)
++                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e));
++        }
+ 
+-        // Serialize IVC proof (fingerprint verification happened at step 0 in circuit)
+-        let ivc_proof = protogalaxy.ivc_proof();
+-        let mut proof_bytes = Vec::new();
+-        ivc_proof.serialize_compressed(&mut proof_bytes)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+-                format!("IVC proof serialization failed: {:?}", e)
+-            ))?;
++        if bundle.len() < 8 {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Bundle too short"));
++        }
+ 
+-        Ok(proof_bytes)
+-    }
++        let chunk_size_in_bundle = u32::from_le_bytes(bundle[0..4].try_into().unwrap()) as usize;
++        if chunk_size_in_bundle != CHUNK_SIZE {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
++                format!("Bundle chunk_size {} != compiled CHUNK_SIZE {}", chunk_size_in_bundle, CHUNK_SIZE)
++            ));
++        }
+ 
+-    /// Verify the IVC proof
+-    fn verify_proof(&self, _proof_bytes: Vec<u8>) -> PyResult<bool> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
++        let proof_len = u32::from_le_bytes(bundle[4..8].try_into().unwrap()) as usize;
++        if bundle.len() < 8 + proof_len {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Bundle truncated"));
++        }
+ 
+-        let ivc_proof = protogalaxy.ivc_proof();
++        let proof_bytes = &bundle[8..8 + proof_len];
+ 
+-        // Re-run ProtoGalaxy verification using the stored proof
+-        // (no stored verifier params — rerun from IVC proof directly)
+-        // For full verification, use ProtoGalaxy's native IVC verifier
+-        let _ = ivc_proof; // IVC state is self-verifying via accumulation
+-        Ok(true) // Proof validity is guaranteed by the folding scheme if prove_step succeeds
+-    }
++        // Deserialize IVC proof
++        let ivc_proof = PGGradIVCProof::deserialize_compressed(proof_bytes)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                format!("IVC proof deserialize failed (tampered?): {:?}", e)
++            ))?;
+ 
+-    /// Get number of proven training steps
+-    fn get_num_steps(&self) -> PyResult<usize> {
+-        Ok(self.num_steps)
+-    }
+-}
++        // Use stored VerifierParams (from initialize())
++        let vp = self.pg_params.as_ref()
++            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                "Prover not initialized. Call initialize() first."
++            ))?.1.clone();
+ 
+-// ============================================================
+-// Legacy Python-facing provers (backward compatibility)
+-// ============================================================
++        // REAL cryptographic verification
++        PGGrad::verify(vp, ivc_proof)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                format!("Proof verification FAILED: {:?}", e)
++            ))?;
+ 
+-/// Legacy bounded prover
+-#[pyclass]
+-pub struct FLZKPBoundedProver {
+-    protogalaxy: Option<ProtoGalaxy<G1, G2, BoundedAdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>>,
+-    pg_params: Option<(
+-        folding_schemes::folding::protogalaxy::ProverParams<G1, G2, Pedersen<G1>, Pedersen<G2>>,
+-        folding_schemes::folding::protogalaxy::VerifierParams<G1, G2, Pedersen<G1>, Pedersen<G2>>,
+-    )>,
+-    current_state: Vec<f64>,
+-}
++        Ok(true)
++    }
+ 
+-#[pymethods]
+-impl FLZKPBoundedProver {
+-    #[new]
+-    fn new() -> Self {
+-        FLZKPBoundedProver {
+-            protogalaxy: None,
+-            pg_params: None,
+-            current_state: vec![0.0],
++    /// Standalone static verifier: verifies a proof bundle without any pre-initialized state.
++    /// Reconstructs VerifierParams from the VP bytes embedded in the bundle.
++    ///
++    /// This is the "server-side" verification path when the verifier doesn't have
++    /// access to the prover's pg_params.
++    /// Returns: (is_valid, norm_sq_accum_str, directional_fp_accum_str, error_msg)
++    #[staticmethod]
++    fn verify_proof_bundle_static(bundle: Vec<u8>) -> PyResult<(bool, String, String, String)> {
++        if bundle.len() >= 4 && &bundle[0..4] == DEC_MAGIC {
++            return match verify_decider_bundle_crypto(&bundle) {
++                Ok((norm_sq_str, dir_fp_str)) => Ok((true, norm_sq_str, dir_fp_str, "Valid".into())),
++                Err(e) => Ok((false, String::new(), String::new(), e)),
++            };
+         }
+-    }
+ 
+-    fn initialize(&mut self, initial_value: f64) -> PyResult<String> {
+-        type PG = ProtoGalaxy<G1, G2, BoundedAdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>;
+-        let f_circuit = BoundedAdditionFCircuit::<Fr>::new(())
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        let poseidon_config = poseidon_canonical_config::<Fr>();
+-        let mut rng = ark_std::rand::rngs::OsRng;
+-        let pg_params = PG::preprocess(&mut rng, &(poseidon_config.clone(), f_circuit))
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        let z_0 = vec![float_to_field(initial_value)];
+-        let protogalaxy = PG::init(&pg_params, f_circuit, z_0)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        self.pg_params = Some(pg_params);
+-        self.protogalaxy = Some(protogalaxy);
+-        self.current_state = vec![initial_value];
+-        Ok("ZKP system initialized (legacy bounded)".to_string())
+-    }
++        if bundle.len() < 8 {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Bundle too short"));
++        }
+ 
+-    fn prove_gradient_step(&mut self, gradient: f64, max_norm: f64) -> PyResult<String> {
+-        let protogalaxy = self.protogalaxy.as_mut()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let mut rng = ark_std::rand::rngs::OsRng;
+-        let gradient_field = float_to_field(gradient);
+-        let max_norm_squared_field = float_to_field(max_norm * max_norm);
+-        if gradient * gradient > max_norm * max_norm + 1e-6 {
++        let chunk_size_in_bundle = u32::from_le_bytes(bundle[0..4].try_into().unwrap()) as usize;
++        if chunk_size_in_bundle != CHUNK_SIZE {
+             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+-                format!("Norm bound violated: |{}|^2 = {} > {}", gradient, gradient * gradient, max_norm * max_norm)
++                format!("Bundle chunk_size {} != compiled CHUNK_SIZE {}", chunk_size_in_bundle, CHUNK_SIZE)
+             ));
+         }
+-        protogalaxy.prove_step(&mut rng, [gradient_field, max_norm_squared_field], None)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        self.current_state[0] += gradient;
+-        Ok(format!("Step proven. State: {}", self.current_state[0]))
+-    }
+ 
+-    fn prove_gradient_batch(&mut self, gradients: Vec<f64>, max_norms: Vec<f64>) -> PyResult<String> {
+-        if gradients.len() != max_norms.len() {
+-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Length mismatch"));
++        let proof_len = u32::from_le_bytes(bundle[4..8].try_into().unwrap()) as usize;
++        if bundle.len() < 8 + proof_len {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Bundle truncated"));
++        }
++
++        let proof_bytes_slice = &bundle[8..8 + proof_len];
++        let vp_bytes_slice = &bundle[8 + proof_len..];
++
++        // Deserialize IVC proof
++        let ivc_proof = PGGradIVCProof::deserialize_compressed(proof_bytes_slice)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                format!("IVC proof deserialize failed (tampered?): {:?}", e)
++            ))?;
++
++        // Extract the final state from the IVC proof before it gets consumed
++        let final_state = ivc_proof.z_i.clone();
++        if final_state.len() < 7 {
++            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                "IVC proof state length is too short to extract directional constraints"
++            ));
+         }
+-        for (i, (&g, &m)) in gradients.iter().zip(max_norms.iter()).enumerate() {
+-            self.prove_gradient_step(g, m)
+-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Step {}: {:?}", i, e)))?;
++        let norm_sq_str = format!("{:?}", final_state[3]);
++        let dir_fp_str = format!("{:?}", final_state[4]);
++
++        let ref_fp_accum_str = format!("{}", final_state[5].into_bigint());
++        let expected_ref_fp_str = format!("{}", ivc_proof.z_0[1].into_bigint());
++        if ref_fp_accum_str != expected_ref_fp_str {
++            return Ok((
++                false, 
++                norm_sq_str, 
++                dir_fp_str, 
++                format!("Spoofed reference gradient detected. Circuit accumulated: {}, Init z_0[1]: {}", ref_fp_accum_str, expected_ref_fp_str)
++            ));
+         }
+-        Ok(format!("Batch of {} proven", gradients.len()))
+-    }
+ 
+-    fn generate_final_proof(&self, py: Python) -> PyResult<PyObject> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let mut proof_bytes = Vec::new();
+-        protogalaxy.U_i.serialize_compressed(&mut proof_bytes)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        protogalaxy.u_i.serialize_compressed(&mut proof_bytes)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        Ok(PyBytes::new(py, &proof_bytes).into())
+-    }
+-
+-    fn verify_proof(&self, _proof_bytes: Vec<u8>) -> PyResult<bool> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let pg_params = self.pg_params.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Params not initialized"))?;
+-        let vp = pg_params.1.clone();
+-        let ivc_proof = protogalaxy.ivc_proof();
+-        type PG = ProtoGalaxy<G1, G2, BoundedAdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>;
+-        PG::verify(vp, ivc_proof)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        Ok(true)
+-    }
++        // Reconstruct VerifierParams via vp_deserialize_with_mode.
++        // This re-generates r1cs and cf_r1cs from the GradientFingerprintCircuit (params = ())
++        // and deserializes cs_vp + cf_cs_vp from the bundle's vp bytes.
++        let vp = PGGrad::vp_deserialize_with_mode(
++            vp_bytes_slice,
++            Compress::Yes,
++            Validate::Yes,
++            (), // GradientFingerprintCircuit::Params = ()
++        ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++            format!("VerifierParams reconstruct failed: {:?}", e)
++        ))?;
++
++        // REAL cryptographic verification — PG::verify checks all polynomial identities
++        PGGrad::verify(vp, ivc_proof)
++            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
++                format!("Proof verification FAILED: {:?}", e)
++            ))?;
+ 
+-    fn get_state(&self) -> PyResult<Vec<f64>> {
+-        Ok(self.current_state.clone())
++        Ok((true, norm_sq_str, dir_fp_str, "Valid".to_string()))
+     }
+ 
+-    fn get_num_steps(&self) -> PyResult<usize> {
+-        if let Some(pg) = &self.protogalaxy {
+-            Ok(pg.i.into_bigint().as_ref()[0] as usize)
+-        } else {
+-            Ok(0)
++    /// Packs multiple **valid** client bundles into one batch blob after running full
++    /// `PGGrad::verify` on each. This is not a single succinct proof; it is a canonical
++    /// container for batched verification.
++    #[staticmethod]
++    fn fold_proofs_bundle(bundles: Vec<Vec<u8>>) -> PyResult<Vec<u8>> {
++        if bundles.is_empty() {
++            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
++                "No proofs to fold",
++            ));
++        }
++        for (i, b) in bundles.iter().enumerate() {
++            verify_any_client_bundle_bytes(b).map_err(|e| {
++                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
++                    "Invalid sub-bundle {}: {}",
++                    i, e
++                ))
++            })?;
+         }
++        Ok(encode_proof_batches(&bundles))
+     }
+-}
+-
+-/// Legacy prover (no bounds)
+-#[pyclass]
+-pub struct FLZKPProver {
+-    protogalaxy: Option<ProtoGalaxy<G1, G2, AdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>>,
+-    pg_params: Option<(
+-        folding_schemes::folding::protogalaxy::ProverParams<G1, G2, Pedersen<G1>, Pedersen<G2>>,
+-        folding_schemes::folding::protogalaxy::VerifierParams<G1, G2, Pedersen<G1>, Pedersen<G2>>,
+-    )>,
+-    current_state: Vec<f64>,
+-}
+ 
+-#[pymethods]
+-impl FLZKPProver {
+-    #[new]
+-    fn new() -> Self {
+-        FLZKPProver {
+-            protogalaxy: None,
+-            pg_params: None,
+-            current_state: vec![0.0],
++    /// Verifies a batch produced by `fold_proofs_bundle`.
++    #[staticmethod]
++    fn verify_batch_bundle_static(batch: Vec<u8>) -> PyResult<(bool, String)> {
++        match decode_and_verify_batch_bundle(&batch) {
++            Ok(n) => Ok((true, format!("Verified {} independent IVC proofs", n))),
++            Err(e) => Ok((false, e)),
+         }
+     }
+ 
+-    fn initialize(&mut self, initial_value: f64) -> PyResult<String> {
+-        type PG = ProtoGalaxy<G1, G2, AdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>;
+-        let f_circuit = AdditionFCircuit::<Fr>::new(())
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        let poseidon_config = poseidon_canonical_config::<Fr>();
+-        let mut rng = ark_std::rand::rngs::OsRng;
+-        let pg_params = PG::preprocess(&mut rng, &(poseidon_config.clone(), f_circuit))
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        let z_0 = vec![float_to_field(initial_value)];
+-        let protogalaxy = PG::init(&pg_params, f_circuit, z_0)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        self.pg_params = Some(pg_params);
+-        self.protogalaxy = Some(protogalaxy);
+-        self.current_state = vec![initial_value];
+-        Ok("ZKP system initialized (legacy)".to_string())
++    fn get_num_steps(&self) -> PyResult<usize> {
++        Ok(self.num_steps)
+     }
+ 
+-    fn prove_gradient_step(&mut self, gradient: f64) -> PyResult<String> {
+-        let protogalaxy = self.protogalaxy.as_mut()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let mut rng = ark_std::rand::rngs::OsRng;
+-        let gradient_field = float_to_field(gradient);
+-        protogalaxy.prove_step(&mut rng, [gradient_field], None)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        self.current_state[0] += gradient;
+-        Ok(format!("Step proven. State: {}", self.current_state[0]))
++    fn get_model_fp(&self) -> PyResult<i64> {
++        Ok(self.model_fp)
+     }
+ 
+-    fn prove_gradient_batch(&mut self, gradients: Vec<f64>) -> PyResult<String> {
+-        for (i, &g) in gradients.iter().enumerate() {
+-            self.prove_gradient_step(g)
+-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Step {}: {:?}", i, e)))?;
+-        }
+-        Ok(format!("Batch of {} proven", gradients.len()))
++    fn get_chunk_size(&self) -> PyResult<usize> {
++        Ok(CHUNK_SIZE)
+     }
+ 
+-    fn generate_final_proof(&self, py: Python) -> PyResult<PyObject> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let mut proof_bytes = Vec::new();
+-        protogalaxy.U_i.serialize_compressed(&mut proof_bytes)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        protogalaxy.u_i.serialize_compressed(&mut proof_bytes)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        Ok(PyBytes::new(py, &proof_bytes).into())
+-    }
+-
+-    fn verify_proof(&self, _proof_bytes: Vec<u8>) -> PyResult<bool> {
+-        let protogalaxy = self.protogalaxy.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Not initialized"))?;
+-        let pg_params = self.pg_params.as_ref()
+-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Params not initialized"))?;
+-        let vp = pg_params.1.clone();
+-        let ivc_proof = protogalaxy.ivc_proof();
+-        type PG = ProtoGalaxy<G1, G2, AdditionFCircuit<Fr>, Pedersen<G1>, Pedersen<G2>>;
+-        PG::verify(vp, ivc_proof)
+-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))?;
+-        Ok(true)
++    /// Returns current accumulated fingerprint value (for debugging)
++    fn get_grad_fp_accum(&self) -> PyResult<String> {
++        if let Some(pg) = &self.protogalaxy {
++            let z_i = &pg.z_i;
++            if z_i.len() >= 3 {
++                return Ok(format!("{:?}", z_i[2]));
++            }
++        }
++        Ok("not initialized".to_string())
+     }
+ 
+-    fn get_state(&self) -> PyResult<Vec<f64>> {
+-        Ok(self.current_state.clone())
++    /// Returns current accumulated norm² value (for server-side EMA bound check)
++    fn get_norm_sq_accum(&self) -> PyResult<String> {
++        if let Some(pg) = &self.protogalaxy {
++            let z_i = &pg.z_i;
++            if z_i.len() >= 4 {
++                return Ok(format!("{:?}", z_i[3]));
++            }
++        }
++        Ok("not initialized".to_string())
+     }
+ 
+-    fn get_num_steps(&self) -> PyResult<usize> {
++    /// Returns current accumulated directional value
++    fn get_directional_fp_accum(&self) -> PyResult<String> {
+         if let Some(pg) = &self.protogalaxy {
+-            Ok(pg.i.into_bigint().as_ref()[0] as usize)
+-        } else {
+-            Ok(0)
++            let z_i = &pg.z_i;
++            if z_i.len() >= 5 {
++                return Ok(format!("{:?}", z_i[4]));
++            }
+         }
++        Ok("not initialized".to_string())
+     }
+ }
+ 
+@@ -781,13 +948,13 @@ impl FLZKPProver {
+ // Utilities
+ // ============================================================
+ 
+-/// Convert f64 to BN254 field element using fixed-point scaling
+-fn float_to_field(value: f64) -> Fr {
+-    let scaled = (value * 1_000_000.0) as i64;
+-    if scaled >= 0 {
+-        Fr::from(scaled as u64)
++/// Convert i64 to BN254 field element.
++/// Replaces the floating point cast to maintain cryptograhic precision boundaries.
++pub fn int_to_field(value: i64) -> Fr {
++    if value >= 0 {
++        Fr::from(value as u64)
+     } else {
+-        -Fr::from((-scaled) as u64)
++        -Fr::from((-value) as u64)
+     }
+ }
+ 
+@@ -797,8 +964,6 @@ fn float_to_field(value: f64) -> Fr {
+ 
+ #[pymodule]
+ fn fl_zkp_bridge(_py: Python, m: &PyModule) -> PyResult<()> {
+-    m.add_class::<FLTrainingProver>()?;
+-    m.add_class::<FLZKPBoundedProver>()?;
+-    m.add_class::<FLZKPProver>()?;
++    m.add_class::<GradientZKProver>()?;
+     Ok(())
+ }
+-- 
+2.52.0
+
