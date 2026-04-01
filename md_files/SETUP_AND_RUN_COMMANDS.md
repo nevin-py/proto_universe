@@ -1,5 +1,7 @@
 # Setup and Run Commands (End-to-End)
 
+For Google Colab usage, see: `md_files/COLAB_SETUP_AND_RUN.md`.
+
 This file provides copy-paste commands to fully set up the project, initialize submodules, build the Rust ZKP bridge, run required tests, and execute the full experiment suite.
 
 ## 0) Prerequisites
