@@ -53,14 +53,15 @@ from src.defense.robust_agg import MultiKrumAggregator, CoordinateWiseMedianAggr
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-def make_logger(log_file: Path) -> logging.Logger:
+def make_logger(log_file: Path, quiet: bool = False) -> logging.Logger:
     logger = logging.getLogger("ZKPResearch")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    if not quiet:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
     fh = logging.FileHandler(log_file, mode="w")
     fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(fh)
@@ -486,18 +487,25 @@ def run_experiment(
 
 # ── Experiment matrix ─────────────────────────────────────────────────────────
 
-def build_configs(quick: bool, fixed_aggregator: str = None) -> List[Tuple]:
+def build_configs(
+    quick: bool,
+    fixed_aggregator: str = None,
+    rounds_override: int = None,
+    local_epochs_override: int = None,
+) -> List[Tuple]:
     """Build experiment configuration matrix."""
     attacks = ["scale_10x", "sign_flip", "gaussian_noise", "random_update"]
     models = ["cnn"] # Focusing on LeNet-5 equivalent CNN
     aggregators = [fixed_aggregator] if fixed_aggregator else ["fedavg", "multi_krum", "coord_median"]
+    rounds = rounds_override if rounds_override is not None else (3 if quick else 5)
+    local_epochs = local_epochs_override if local_epochs_override is not None else 2
 
     if quick:
         # One attack per aggregator, smallest config (sanity check)
         return [
-            ("cnn", 10, 0.3, "scale_10x",   3, 2, 42, aggregators[0]),
-            ("cnn", 10, 0.3, "sign_flip",    3, 2, 43, aggregators[1 % len(aggregators)]),
-            ("cnn", 10, 0.3, "gaussian_noise", 3, 2, 44, aggregators[2 % len(aggregators)]),
+            ("cnn", 10, 0.3, "scale_10x", rounds, local_epochs, 42, aggregators[0]),
+            ("cnn", 10, 0.3, "sign_flip", rounds, local_epochs, 43, aggregators[1 % len(aggregators)]),
+            ("cnn", 10, 0.3, "gaussian_noise", rounds, local_epochs, 44, aggregators[2 % len(aggregators)]),
         ]
 
     # Full matrix:
@@ -511,7 +519,7 @@ def build_configs(quick: bool, fixed_aggregator: str = None) -> List[Tuple]:
                     for agg in aggregators:
                         seed = base_seed
                         base_seed += 1
-                        configs.append((model, n_clients, byz_frac, attack, 5, 2, seed, agg))
+                        configs.append((model, n_clients, byz_frac, attack, rounds, local_epochs, seed, agg))
     return configs
 
 
@@ -526,14 +534,30 @@ def main():
                         help="Gradient elements sampled per proof (default 1000)")
     parser.add_argument("--aggregator", type=str, choices=["fedavg", "multi_krum", "coord_median"],
                         help="Fix a single aggregator for all tests instead of the full matrix")
+    parser.add_argument("--max-experiments", type=int, default=None,
+                        help="Cap number of experiments from generated matrix (safe mode)")
+    parser.add_argument("--rounds", type=int, default=None,
+                        help="Override rounds per experiment")
+    parser.add_argument("--local-epochs", type=int, default=None,
+                        help="Override local epochs per experiment")
+    parser.add_argument("--torch-threads", type=int, default=1,
+                        help="Limit PyTorch CPU threads to reduce system load (default: 1)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Disable console logging; write logs to file only")
     args = parser.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output) / f"run_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    torch.set_num_threads(max(1, args.torch_threads))
+    try:
+        torch.set_num_interop_threads(max(1, args.torch_threads))
+    except RuntimeError:
+        pass
+
     global log
-    log = make_logger(out_dir / "main.log")
+    log = make_logger(out_dir / "main.log", quiet=args.quiet)
 
     log.info("=" * 90)
     log.info("ZK PROOF-OF-GRADIENT RESEARCH EXPERIMENTS")
@@ -545,7 +569,14 @@ def main():
     log.info(f"Gradient sample size: {args.grad_sample}")
     log.info(f"Fixed Aggregator: {args.aggregator if args.aggregator else 'All'}")
 
-    configs = build_configs(args.quick, args.aggregator)
+    configs = build_configs(
+        args.quick,
+        args.aggregator,
+        rounds_override=args.rounds,
+        local_epochs_override=args.local_epochs,
+    )
+    if args.max_experiments is not None:
+        configs = configs[:max(0, args.max_experiments)]
     log.info(f"Total experiments: {len(configs)}")
 
     all_results = []

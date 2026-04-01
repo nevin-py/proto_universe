@@ -50,6 +50,7 @@ Always report **mean ± std**, 95% CI, and number of seeds.
 5. `PGFB` batch verification consistency
 
 Use:
+
 - `tests/test_zkp_soundness.py`
 - `tests/test_zkp_prover.py`
 - one end-to-end integration run with logging enabled
@@ -61,12 +62,14 @@ Use:
 ### B1. Non-toy benchmark (CRITICAL)
 
 You must include **CIFAR-10** with a standard architecture:
+
 - Preferred: `ResNet-18`
 - Acceptable: `ResNet-9` (if compute constrained)
 
 ### B2. Data heterogeneity (CRITICAL)
 
 Run both data regimes:
+
 - IID
 - Non-IID Dirichlet partition (`beta=0.5` and `beta=0.1`)
 
@@ -80,6 +83,7 @@ Run both data regimes:
 - Aggregators: `fedavg`, `multi_krum`
 
 Recommended minimal runs:
+
 - **FashionMNIST**: 8 runs (sanity + trend)
 - **CIFAR-10**: 12 runs (core paper evidence)
 - For each run: **3 seeds minimum** (5 preferred camera-ready)
@@ -89,6 +93,7 @@ Recommended minimal runs:
 ## C. Utility retention controls
 
 For both FashionMNIST and CIFAR-10:
+
 - No attack (`alpha=0.0`) under IID + Non-IID
 - Same training budget and model as section B
 - Report:
@@ -102,11 +107,13 @@ Minimum: 6 runs × 3 seeds.
 ## D. Scalability figure (must expose O(N) verification honestly)
 
 To avoid reviewer concern about hidden linear cost, extend client counts:
+
 - Clients: `10, 50, 100, 200`
 - Fixed: attack=`sign_flip`, alpha=`0.3`, model=primary model (`resnet18` if possible), aggregator=`multi_krum`
 - Gradient sample sizes: `500, 1000, 2000` (or one fixed sample if compute-limited)
 
 Report:
+
 - total verify time vs clients
 - per-client verify time
 - proof size and total batch payload
@@ -126,6 +133,7 @@ High-impact ablations only:
 4. Remove both bounds (crypto binding only)
 
 Evaluate on hardest setting:
+
 - dataset=`CIFAR-10`
 - model=`resnet18`/`resnet9`
 - clients=`20`
@@ -140,6 +148,7 @@ Minimum: 4 variants × 3 seeds.
 ## 4) Baselines policy (implementation + literature)
 
 ## 4.1 Implemented baselines (run these)
+
 - `FedAvg`
 - `Multi-Krum`
 - `Coordinate-wise median` (if stable)
@@ -149,6 +158,7 @@ Do not claim FLTrust unless your FLTrust pipeline is fully implemented end-to-en
 ## 4.2 Literature cryptographic baseline (must include in text)
 
 Even if not runnable in your repo, include comparison section against prior robust/cryptographic FL work (e.g., RoFL-style papers):
+
 - threat model coverage
 - proof system assumptions
 - asymptotic complexity (prover/verifier)
@@ -173,6 +183,7 @@ Provide a table: **FiZK vs prior work** (theoretical + reported practical costs)
 ## 6) Reproducibility Requirements
 
 For each run store:
+
 - full config JSON
 - git commit hash
 - seed
@@ -180,6 +191,7 @@ For each run store:
 - per-round metrics and final summary
 
 Directory convention:
+
 - `outputs/paper_essential/<timestamp>/<experiment_family>/...`
 
 ---
@@ -203,6 +215,7 @@ If compute-limited, never skip steps 2, 3, or 5.
 Current runner supports essential knobs but may need extension for CIFAR and explicit Dirichlet in the same script path.
 
 Use:
+
 - `scripts/run_zkp_research.py` for existing matrix and timing instrumentation
 - extend config builder to include:
   - dataset switch: `FashionMNIST` + `CIFAR-10`
