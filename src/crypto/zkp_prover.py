@@ -7,12 +7,12 @@ Architecture (architecture.md):
   - EMA-based dynamic bound: B_l = EMA(Q25 * (1 + γ), β=0.9, γ=5.0)
   - Defense pipeline: Merkle → IO check → Cosine filter → Multi-Krum → IVC fold
 
-Circuit state z = [model_fp, grad_fp_accum, norm_sq_accum, step_count] (4 elements)
+# Circuit state z = [model_fp, ref_grad_fp, grad_fp_accum, norm_sq_accum, directional_fp_accum, ref_fp_accum, step_count] (7 elements)
 The circuit accumulates both the Schwartz-Zippel fingerprint AND the quantized L2 norm².
 """
 
-import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -29,10 +29,14 @@ _GradientZKProver = None
 try:
     from fl_zkp_bridge import GradientZKProver as _GradientZKProver
     _ZKP_AVAILABLE = True
-    logger.info("✓ fl_zkp_bridge loaded — GradientFingerprintCircuit (CHUNK=2048, 4-state) enabled")
+    logger.info(
+        "✓ fl_zkp_bridge loaded — GradientFingerprintCircuit (CHUNK=2048, 7-state) enabled"
+    )
 except ImportError:
+    _GradientZKProver = None
+    _ZKP_AVAILABLE = False
     logger.warning(
-        "fl_zkp_bridge not available. Build with: "
+        "fl_zkp_bridge not installed. Real ZKP is unavailable; build with: "
         "cd sonobe/fl-zkp-bridge && maturin develop --release"
     )
 
@@ -42,6 +46,9 @@ SCALE      = 1_000_000     # 10^6 quantization: FP32 → finite field integer
 EMA_BETA   = 0.9           # Sybil EMA momentum (architecture.md §3.1)
 EMA_GAMMA  = 5.0           # Tolerance multiplier
 QUANT_SAFE = 2 ** 63 - 1   # Keep fingerprints in i64 range
+
+# Batch wire format from `fl_zkp_bridge::encode_proof_batches` (magic PGFB)
+BATCH_MAGIC = b"PGFB"
 
 
 # ── GradientProofBundle ────────────────────────────────────────────────────────
@@ -63,12 +70,54 @@ class GradientProofBundle:
     client_id: int
     round_number: int
     prove_time_ms: float
-    is_real: bool              # True = ProtoGalaxy IVC, False = SHA-256 fallback
+    is_real: bool              # True = ProtoGalaxy IVC
     model_type: str = "unknown"
 
     @property
     def proof_size(self) -> int:
         return len(self.proof_bytes)
+
+
+@dataclass
+class ZKProof:
+    """Pipeline-facing proof object: wraps IVC bundle bytes plus FL metadata.
+
+    `gradient_bundle` holds the same proof as `proof_bytes` for single-client proofs.
+    Galaxy batch proofs use `proof_bytes` with BATCH_MAGIC and embed a nested
+    `GradientProofBundle` placeholder for bookkeeping.
+    """
+
+    proof_bytes: bytes
+    claimed_sum: float
+    num_steps: int
+    client_id: int
+    round_number: int
+    prove_time_ms: float
+    is_real: bool
+    layer_sums: List[float] = field(default_factory=list)
+    gradient_bundle: Optional[GradientProofBundle] = None
+
+    @property
+    def proof_size(self) -> int:
+        return len(self.proof_bytes)
+
+    @classmethod
+    def from_gradient_bundle(
+        cls,
+        gb: GradientProofBundle,
+        layer_sums: List[float],
+    ) -> "ZKProof":
+        return cls(
+            proof_bytes=gb.proof_bytes,
+            claimed_sum=float(sum(layer_sums)),
+            num_steps=gb.num_steps,
+            client_id=gb.client_id,
+            round_number=gb.round_number,
+            prove_time_ms=gb.prove_time_ms,
+            is_real=gb.is_real,
+            layer_sums=list(layer_sums),
+            gradient_bundle=gb,
+        )
 
 
 # ── EMA Bound Manager (architecture.md §3.1) ───────────────────────────────────
@@ -258,7 +307,12 @@ class ModelAgnosticProver:
                 4096 → 2 IVC steps (fast, ~6 digits security margin).
                 Use full gradient for small models (linear ~7850 → 4 steps).
         """
-        self._is_real = _ZKP_AVAILABLE and _GradientZKProver is not None
+        if not (_ZKP_AVAILABLE and _GradientZKProver is not None):
+            raise RuntimeError(
+                "ProtoGalaxy ZKP bridge is unavailable. "
+                "Build sonobe/fl-zkp-bridge (maturin develop --release)."
+            )
+        self._is_real = True
         self.grad_sample_size = grad_sample_size
 
     @property
@@ -333,14 +387,9 @@ class ModelAgnosticProver:
         # Calculate the precise mathematical reference accumulator to pass to the strict rust bindings
         true_ref_fp = FingerprintHelper.compute_gradient_fingerprint(ref_padded.astype(np.int64), r_chunks, apply_modulo=False)
 
-        if self._is_real:
-            bundle_bytes, num_steps, grad_fp, norm_sq_q, dir_fp_q = self._prove_real(
-                model_fp, true_ref_fp, g_padded, ref_padded, r_chunks, num_chunks
-            )
-        else:
-            bundle_bytes, num_steps, grad_fp, norm_sq_q, dir_fp_q = self._prove_fallback(
-                model_fp, true_ref_fp, g_padded, ref_padded, r_chunks
-            )
+        bundle_bytes, num_steps, grad_fp, norm_sq_q, dir_fp_q = self._prove_real(
+            model_fp, true_ref_fp, g_padded, ref_padded, r_chunks, num_chunks
+        )
 
         elapsed_ms = (time.time() - start) * 1000
         return GradientProofBundle(
@@ -397,28 +446,143 @@ class ModelAgnosticProver:
         )
         return bundle, num_steps, grad_fp, norm_sq_q, dir_fp_q
 
-    def _prove_fallback(
+
+class GradientSumCheckProver:
+    """Back-compat name: proves per-client gradients via ProtoGalaxy IVC (ModelAgnosticProver)."""
+
+    def __init__(
         self,
-        model_fp: int,
-        ref_grad_fp: int,
-        g_padded: np.ndarray,
-        ref_padded: np.ndarray,
-        r_chunks: List[np.ndarray],
-    ) -> Tuple[bytes, int, int, float, float]:
-        """SHA-256 commitment fallback (NOT a ZK proof — labeled clearly)."""
-        grad_fp = FingerprintHelper.compute_gradient_fingerprint(g_padded.astype(np.int64), r_chunks)
-        norm_sq_q = float(np.sum(g_padded.astype(np.int64) ** 2))
-        dir_fp_q = float(np.sum(g_padded.astype(np.int64) * ref_padded.astype(np.int64)))
-        # Bundle = SHA-256(model_fp || ref_grad_fp || grad_fp || norm_sq || dir_fp)
-        hasher = hashlib.sha256()
-        hasher.update(f"{model_fp}:{ref_grad_fp}:{grad_fp}:{norm_sq_q}:{dir_fp_q}".encode())
-        bundle = hasher.digest()
-        num_steps = len(r_chunks)
-        logger.warning(
-            f"[FALLBACK] SHA-256 commitment (not ZK proof). "
-            f"Build Rust extension for real ProtoGalaxy IVC."
+        global_model: Optional[torch.nn.Module] = None,
+        grad_sample_size: int = 4096,
+    ):
+        self.global_model = global_model
+        self.grad_sample_size = grad_sample_size
+        self._inner: Optional[ModelAgnosticProver] = None
+        if _ZKP_AVAILABLE:
+            self._inner = ModelAgnosticProver(grad_sample_size=grad_sample_size)
+
+    @property
+    def _is_real(self) -> bool:
+        return bool(_ZKP_AVAILABLE and self._inner is not None)
+
+    def prove_gradient_sum(
+        self,
+        gradients: List[torch.Tensor],
+        client_id: int,
+        round_number: int,
+        model_fp: Optional[int] = None,
+        ref_gradients: Optional[List[torch.Tensor]] = None,
+    ) -> ZKProof:
+        """Generate one client's IVC proof over gradient samples.
+
+        When ``global_model`` was passed to the constructor, fingerprints bind to the
+        current global weights; otherwise uses all-zero reference (test mode).
+        """
+        if self._inner is None:
+            raise RuntimeError("fl_zkp_bridge is not available")
+
+        if ref_gradients is None:
+            if self.global_model is not None:
+                ref_gradients = [
+                    torch.zeros_like(p, device=p.device) for p in self.global_model.parameters()
+                ]
+            else:
+                ref_gradients = [torch.zeros_like(g) for g in gradients]
+
+        if model_fp is None:
+            if self.global_model is None:
+                model_fp = 0
+            else:
+                model_fp, _ = FingerprintHelper.compute_model_fingerprint(
+                    list(self.global_model.parameters()), round_number
+                )
+
+        gb = self._inner.generate_proof(
+            gradients=gradients,
+            ref_gradients=ref_gradients,
+            model_fp=model_fp,
+            ref_grad_fp=0,
+            client_id=client_id,
+            round_number=round_number,
         )
-        return bundle, num_steps, grad_fp, norm_sq_q, dir_fp_q
+        layer_sums = [float(g.detach().float().sum().item()) for g in gradients]
+        return ZKProof.from_gradient_bundle(gb, layer_sums)
+
+    @staticmethod
+    def verify_proof(proof: ZKProof) -> bool:
+        if not proof.proof_bytes:
+            return False
+        if proof.proof_bytes[: len(BATCH_MAGIC)] == BATCH_MAGIC:
+            if not _ZKP_AVAILABLE or _GradientZKProver is None:
+                return False
+            ok, _msg = _GradientZKProver.verify_batch_bundle_static(list(proof.proof_bytes))
+            return bool(ok)
+        if proof.gradient_bundle is not None:
+            ok, _ = verify_gradient_proof(
+                proof.gradient_bundle,
+                expected_model_fp=None,
+                ema_bound=None,
+            )
+            return bool(ok)
+        return False
+
+
+class GalaxyProofFolder:
+    """Packages multiple client IVC proofs into one verified batch blob (O(N) verify)."""
+
+    def fold_galaxy_proofs(self, proofs: List[ZKProof], galaxy_id: int) -> ZKProof:
+        if not proofs:
+            return ZKProof(
+                proof_bytes=b"",
+                claimed_sum=0.0,
+                num_steps=0,
+                client_id=-1,
+                round_number=0,
+                prove_time_ms=0.0,
+                is_real=False,
+                layer_sums=[],
+            )
+        subs = [p.gradient_bundle for p in proofs if p.gradient_bundle is not None]
+        if len(subs) != len(proofs):
+            raise RuntimeError("Galaxy fold requires each ZKProof.gradient_bundle to be set")
+        folded_gb = fold_gradient_proof_bundles(subs)
+        all_layers: List[float] = []
+        for p in proofs:
+            all_layers.extend(p.layer_sums)
+        return ZKProof(
+            proof_bytes=folded_gb.proof_bytes,
+            claimed_sum=float(sum(p.claimed_sum for p in proofs)),
+            num_steps=sum(p.num_steps for p in proofs),
+            client_id=galaxy_id,
+            round_number=proofs[0].round_number,
+            prove_time_ms=0.0,
+            is_real=all(p.is_real for p in proofs),
+            layer_sums=all_layers,
+            gradient_bundle=folded_gb,
+        )
+
+
+def fold_gradient_proof_bundles(bundles: List[GradientProofBundle]) -> GradientProofBundle:
+    """Pack independent client bundles after full per-bundle PG::verify in Rust."""
+    if not bundles:
+        raise ValueError("fold_gradient_proof_bundles: empty bundle list")
+    if not _ZKP_AVAILABLE or _GradientZKProver is None:
+        raise RuntimeError("fl_zkp_bridge is required for proof batching")
+    raw = [list(b.proof_bytes) for b in bundles]
+    folded = _GradientZKProver.fold_proofs_bundle(raw)
+    return GradientProofBundle(
+        proof_bytes=bytes(folded),
+        model_fp=bundles[0].model_fp,
+        grad_fp=0,
+        norm_sq_quantized=0.0,
+        directional_fp_quantized=0.0,
+        num_steps=sum(b.num_steps for b in bundles),
+        num_gradient_elements=sum(b.num_gradient_elements for b in bundles),
+        client_id=0,
+        round_number=bundles[0].round_number,
+        prove_time_ms=0.0,
+        is_real=True,
+    )
 
 
 # ── verify_gradient_proof (architecture.md §4 Phase 2) ─────────────────────────
@@ -445,6 +609,15 @@ def verify_gradient_proof(
         logger.warning(f"Client {bundle.client_id}: empty proof bundle")
         return False, "empty proof bundle"
 
+    # Batch envelope: N independent IVC bundles (each already cryptographically verified in Rust).
+    if bundle.proof_bytes[: len(BATCH_MAGIC)] == BATCH_MAGIC:
+        if not _ZKP_AVAILABLE or _GradientZKProver is None:
+            return False, "fl_zkp_bridge unavailable for batch verification"
+        ok, msg = _GradientZKProver.verify_batch_bundle_static(list(bundle.proof_bytes))
+        if not ok:
+            return False, msg
+        return True, msg or "Valid batch"
+
     norm_sq_quantized = bundle.norm_sq_quantized
     dir_fp_quantized = bundle.directional_fp_quantized
 
@@ -457,7 +630,6 @@ def verify_gradient_proof(
                 logger.warning(f"Client {bundle.client_id}: PG::verify FAILED ({msg})")
                 return False, f"PG::verify FAILED: {msg}"
 
-            import re
             m_norm = re.search(r'BigInt\(\[([^\]]+)\]\)', norm_str)
             if m_norm:
                 parts = [int(x.strip()) for x in m_norm.group(1).split(',')]
@@ -486,8 +658,7 @@ def verify_gradient_proof(
             logger.warning(f"Client {bundle.client_id}: PG::verify ERROR — {e}")
             return False, f"PG::verify ERROR — {e}"
     else:
-        # Fallback: basic structure check
-        logger.warning(f"Client {bundle.client_id}: FALLBACK verification — not cryptographically sound")
+        return False, "Non-real proof rejected: fallback proofs are disabled"
 
     # 1. EMA norm bound check
     if ema_bound is not None and ema_bound.bound is not None:
@@ -505,28 +676,31 @@ def verify_gradient_proof(
 
     return True, "Valid"
 
-def fold_proofs_bundle(bundles: List[GradientProofBundle]) -> GradientProofBundle:
-    """Phase 4: Multi-prover representation folding. 
+def verify_proof_batch(bundles: List[GradientProofBundle]) -> Tuple[bool, str]:
+    """Verify a batch of independent ZK proofs natively without folding.
     
-    Synthesizes multiple valid client IVC proofs into a single verifiable bundle pi_gfold.
+    Proof-Carrying Data (PCD) for combining independent IVC proofs is not natively 
+    supported by upstream Sonobe for ProtoGalaxy. We perform rigorous O(N) validation.
+    
+    Args:
+        bundles: List of client proofs to verify
+        
+    Returns:
+        (bool, reason): True if all proven mathematically valid, False otherwise
     """
-    if not _ZKP_AVAILABLE or not bundles:
-        return bundles[0] if bundles else None
-    
-    bundled_bytes = [list(b.proof_bytes) for b in bundles]
-    folded_bytes = _GradientZKProver.fold_proofs_bundle(bundled_bytes)
-    
-    # Return synthetic fold bundle representing the compressed proofs
-    return GradientProofBundle(
-        proof_bytes=bytes(folded_bytes),
-        model_fp=bundles[0].model_fp,
-        grad_fp=0,
-        norm_sq_quantized=0.0,
-        directional_fp_quantized=0.0,
-        num_steps=0,
-        num_gradient_elements=bundles[0].num_gradient_elements,
-        client_id=0,
-        round_number=bundles[0].round_number,
-        prove_time_ms=0.0,
-        is_real=True,
-    )
+    if not _ZKP_AVAILABLE:
+        raise RuntimeError("ZKP bridge unavailable. Fallback verification is disabled.")
+
+    if not bundles:
+        return False, "No proofs to verify"
+
+    try:
+        for i, bundle in enumerate(bundles):
+            ok, msg = verify_gradient_proof(bundle, expected_model_fp=bundle.model_fp)
+            if not ok:
+                return False, f"Proof {i} failed: {msg}"
+        
+        return True, "All component proofs cleanly verified natively"
+    except Exception as e:
+        logger.error(f"Batch verification failed: {e}")
+        return False, str(e)

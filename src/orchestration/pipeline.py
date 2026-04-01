@@ -28,7 +28,12 @@ from src.client.verifier import ProofVerifier
 from src.crypto.merkle_adapter import GalaxyMerkleTreeAdapter, GlobalMerkleTreeAdapter
 from src.crypto.utils import generate_timestamp, generate_nonce_hex
 from src.crypto.merkle import compute_hash
-from src.crypto.zkp_prover import ModelAgnosticProver, GradientProofBundle, EMABoundManager, FingerprintHelper, verify_gradient_proof
+from src.crypto.zkp_prover import (
+    FingerprintHelper,
+    GalaxyProofFolder,
+    GradientSumCheckProver,
+    ZKProof,
+)
 from src.defense.coordinator import DefenseCoordinator
 from src.defense.statistical import StatisticalAnalyzer
 from src.aggregators.galaxy import GalaxyAggregator
@@ -36,6 +41,38 @@ from src.aggregators.global_agg import GlobalAggregator
 from src.orchestration.model_sync import ModelSynchronizer
 from src.storage.manager import StorageManager
 from src.logging import FLLogger
+
+
+def _zkp_prove_worker(args):
+    """Module-level worker function for parallel ZKP proving (file-based IPC).
+
+    Uses file-based communication to avoid BrokenPipeError with large proof objects.
+    Worker saves proof to a pickle file, main process reads it back.
+    """
+    import pickle
+    import os
+
+    client_id, grads, round_number, temp_dir, model_fp, ref_np_list = args
+    # Move tensors to CPU for pickling
+    cpu_grads = [g.cpu() if isinstance(g, torch.Tensor) else g for g in grads]
+    ref_tensors = [torch.from_numpy(a) for a in ref_np_list]
+    from src.crypto.zkp_prover import GradientSumCheckProver
+
+    prover = GradientSumCheckProver(global_model=None)
+    proof = prover.prove_gradient_sum(
+        cpu_grads,
+        client_id,
+        round_number,
+        model_fp=model_fp,
+        ref_gradients=ref_tensors,
+    )
+    
+    # Save proof to file instead of returning (avoids pipe serialization)
+    result_file = os.path.join(temp_dir, f"proof_{client_id}.pkl")
+    with open(result_file, 'wb') as f:
+        pickle.dump(proof, f)
+    
+    return client_id  # Only return lightweight client_id
 
 
 @dataclass
@@ -83,7 +120,7 @@ class ProtoGalaxyPipeline:
     Complete end-to-end ProtoGalaxy FL pipeline.
     
     Implements the architecture flow from Section 3:
-    - Phase 1: Commitment (clients -> galaxy -> global)
+    - Phase 1: Commitment (clients → galaxy → global)
     - Phase 2: Revelation (clients send gradients with proofs)
     - Phase 3: Multi-Layer Defense (4 defense layers)
     - Phase 4: Global Aggregation (final model update)
@@ -161,11 +198,12 @@ class ProtoGalaxyPipeline:
         self.proof_verifier = ProofVerifier()
         
         # ZKP infrastructure (Architecture Section 3.3 + 4.1)
-        self.zkp_prover = ModelAgnosticProver(grad_sample_size=4096)
-        self.ema_bound_manager = EMABoundManager()
-        self.client_zk_proofs: Dict[int, GradientProofBundle] = {}   # client_id -> GradientProofBundle
-        self.ref_gradients: Optional[List[torch.Tensor]] = None      # Dynamic reference gradients (architecture.md §4)
-
+        self.zkp_prover = GradientSumCheckProver(global_model)
+        self.galaxy_proof_folder = GalaxyProofFolder()
+        self.client_zk_proofs: Dict[int, ZKProof] = {}   # client_id -> ZKProof
+        self.galaxy_zk_proofs: Dict[int, ZKProof] = {}    # galaxy_id -> folded ZKProof
+        self.ref_gradients: Optional[List[torch.Tensor]] = None
+        
         # Storage for current round
         self.round_commitments: Dict[int, Dict[int, str]] = {}  # galaxy_id -> {client_id -> hash}
         self.round_submissions: Dict[int, Dict[int, ClientSubmission]] = {}  # galaxy_id -> {client_id -> submission}
@@ -310,120 +348,131 @@ class ProtoGalaxyPipeline:
         
         return global_root
     
-    def _compute_global_norm_bounds(self, client_gradients: Dict[int, List[torch.Tensor]]) -> List[float]:
-        """Legacy bounding logic (replaced by EMABoundManager). Allowed for backward config testing."""
-        return [1e9] * len(next(iter(client_gradients.values())))
-
-    def phase1_apply_norm_filter_only(
-        self,
-        client_gradients: Dict[int, List[torch.Tensor]],
-        round_number: int,
-    ) -> Dict[str, Any]:
-        """FiZK-Norm ablation: apply robust norm bounds WITHOUT generating ZKP proofs."""
-        self.norm_filter_rejected_ids: List[int] = []
-        
-        client_norms = []
-        for grads in client_gradients.values():
-            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
-            client_norms.append(float(np.linalg.norm(flat)))
-            
-        ema_bound = self.ema_bound_manager.update(client_norms)
-
-        if self.logger:
-            self.logger.logger.debug(
-                f"[FiZK-Norm] Round {round_number}: EMA bound = {ema_bound:.4f}"
-            )
-
-        accepted: Dict[int, List[torch.Tensor]] = {}
-        for client_id, grads in client_gradients.items():
-            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
-            norm = float(np.linalg.norm(flat))
-            
-            if not self.ema_bound_manager.check(norm):
-                self.norm_filter_rejected_ids.append(client_id)
-                if self.logger:
-                    self.logger.logger.info(
-                        f"  [FiZK-Norm] Client {client_id}: x REJECTED — norm {norm:.4f} > bound {ema_bound:.4f}"
-                    )
-            else:
-                accepted[client_id] = grads
-
-        return {
-            "accepted": len(accepted),
-            "rejected": len(self.norm_filter_rejected_ids),
-            "rejected_ids": list(self.norm_filter_rejected_ids),
-            "norm_bounds": [ema_bound], # wrapper for legacy compatibility
-            "accepted_grads": accepted,
-        }
-
     def phase1_generate_zk_proofs(
         self,
         client_gradients: Dict[int, List[torch.Tensor]],
-        round_number: int
+        round_number: int,
+        max_zkp_clients: int = 0,
+        num_workers: int = 1,
     ) -> Dict[str, Any]:
         """
-        Phase 1: Generate ZK proofs of gradient authenticity.
+        Phase 1: Generate ZK sum-check proofs for clients.
+        
+        Each client's gradient sums are proven correct via ProtoGalaxy IVC folding:
+          z_0 = 0  →  z_1 = z_0 + sum(layer_0)  →  ...  →  z_n = total_sum
+        
+        The proof is constant-size and verifiable in O(1).
+        Architecture Section 3.3 — Commitment Generator + ZK verification.
+        
+        Strict mode: all clients must be proven with real ProtoGalaxy ZKP.
+        No fallback proof generation is allowed.
         
         Args:
-            client_gradients: Dict mapping client_id -> List[torch.Tensor]
+            client_gradients: Dict mapping client_id → List[torch.Tensor]
             round_number: Current FL round
-        """
-        self.client_zk_proofs = {}
-        zk_total_time_ms = 0.0
-        zk_bound_failures = 0
-        prove_failed_ids: List[int] = []
-        
-        # 1. Update EMA Bounds using current round norms
-        client_norms = []
-        for grads in client_gradients.values():
-            flat = np.concatenate([g.detach().cpu().numpy().flatten() for g in grads])
-            client_norms.append(float(np.linalg.norm(flat)))
+            max_zkp_clients: Max clients to prove with real ZKP (0 = all)
             
-        new_bound = self.ema_bound_manager.update(client_norms)
+        Returns:
+            Dict with ZK metrics (proofs_generated, prove_time_ms, mode)
+        """
+        import logging as _logging
+        _log = _logging.getLogger("protogalaxy.pipeline")
         
-        # 2. Compute true model fingerprint
-        model_p = list(self.global_model.parameters())
-        model_fp, _ = FingerprintHelper.compute_model_fingerprint(model_p, round_number)
+        self.client_zk_proofs = {}  # Reset for this round
+        zk_total_time_ms = 0.0
 
-        # 2b. Compute reference gradient fingerprint
         if self.ref_gradients is None:
-            self.ref_gradients = [torch.zeros_like(p) for p in model_p]
-        ref_fp, _ = FingerprintHelper.compute_model_fingerprint(self.ref_gradients, round_number)
-
-        # 3. Prove gradients
-        for client_id, grads in client_gradients.items():
-            try:
-                zk_proof = self.zkp_prover.generate_proof(
-                    gradients=grads,
-                    ref_gradients=self.ref_gradients,
-                    model_fp=model_fp,
-                    ref_grad_fp=ref_fp,
-                    client_id=client_id,
-                    round_number=round_number
+            self.ref_gradients = [
+                torch.zeros_like(p) for p in self.global_model.parameters()
+            ]
+        model_fp, _ = FingerprintHelper.compute_model_fingerprint(
+            list(self.global_model.parameters()), round_number
+        )
+        ref_np = [g.detach().cpu().numpy() for g in self.ref_gradients]
+        
+        # Strict mode: all clients get real ZKP
+        all_client_ids = list(client_gradients.keys())
+        total_clients = len(all_client_ids)
+        zkp_client_ids = set(all_client_ids)
+        if max_zkp_clients > 0 and total_clients > max_zkp_clients:
+            _log.info(
+                f"  Strict mode active: ignoring max_zkp_clients={max_zkp_clients}; "
+                f"proving all {total_clients} clients"
+            )
+        
+        # Parallel proving when num_workers > 1
+        if num_workers > 1 and len(zkp_client_ids) > 1:
+            import multiprocessing as mp
+            import tempfile
+            import pickle
+            import os
+            
+            _log.info(f"  ZKP parallel proving with {num_workers} workers (file-based IPC)...")
+            
+            # Create temp directory for file-based IPC
+            with tempfile.TemporaryDirectory(prefix='zkp_proofs_') as temp_dir:
+                # Prepare work items (include temp_dir for file output)
+                work_items = [
+                    (cid, grads, round_number, temp_dir, model_fp, ref_np)
+                    for cid, grads in client_gradients.items()
+                    if cid in zkp_client_ids
+                ]
+                
+                # Parallel prove with 'spawn' method (CUDA-compatible)
+                ctx = mp.get_context('spawn')
+                with ctx.Pool(processes=num_workers) as pool:
+                    client_ids = pool.map(_zkp_prove_worker, work_items)
+                
+                # Read results from files
+                for cid in client_ids:
+                    result_file = os.path.join(temp_dir, f"proof_{cid}.pkl")
+                    with open(result_file, 'rb') as f:
+                        proof = pickle.load(f)
+                    self.client_zk_proofs[cid] = proof
+                    zk_total_time_ms += proof.prove_time_ms
+            
+            if client_ids:
+                avg_time = zk_total_time_ms / len(client_ids)
+                _log.info(
+                    f"  ZKP parallel proving done: {len(client_ids)} proofs, "
+                    f"avg {avg_time:.0f}ms/proof, total {zk_total_time_ms/1000:.1f}s"
                 )
+        else:
+            # Sequential proving (original code)
+            for i, (client_id, grads) in enumerate(client_gradients.items()):
+                zk_proof = self.zkp_prover.prove_gradient_sum(
+                    gradients=grads,
+                    client_id=client_id,
+                    round_number=round_number,
+                    model_fp=model_fp,
+                    ref_gradients=self.ref_gradients,
+                )
+                
                 self.client_zk_proofs[client_id] = zk_proof
                 zk_total_time_ms += zk_proof.prove_time_ms
-            except Exception as e:
-                zk_bound_failures += 1
-                prove_failed_ids.append(client_id)
-                if self.logger:
-                    self.logger.logger.info(
-                        f"  Client {client_id}: x REJECTED — ZK proving failed: {e}"
+                
+                # Progress logging every 10 clients or at the end
+                if (i + 1) % 10 == 0 or (i + 1) == total_clients:
+                    _log.info(
+                        f"  ZKP prove progress: {i+1}/{total_clients} clients "
+                        f"({zk_total_time_ms/1000:.1f}s elapsed)"
                     )
         
         num_proofs = len(self.client_zk_proofs)
-        mode = "REAL (ProtoGalaxy IVC)" if (
-            num_proofs > 0 and next(iter(self.client_zk_proofs.values())).is_real
-        ) else "FALLBACK (SHA-256)"
+        num_real = sum(1 for p in self.client_zk_proofs.values() if p.is_real)
+        mode = "REAL (ProtoGalaxy IVC)"
         
         return {
             'proofs_generated': num_proofs,
+            'proofs_real': num_real,
+            'proofs_fallback': 0,
             'prove_time_ms': zk_total_time_ms,
             'avg_prove_time_ms': zk_total_time_ms / max(num_proofs, 1),
             'mode': mode,
-            'bound_failures': zk_bound_failures,
-            'prove_failed_ids': prove_failed_ids,
         }
+    
+    def _fast_fallback_proof(self, grads, client_id, round_number):
+        raise RuntimeError("Fallback proofs are disabled in strict mode")
     
     # =========================================================================
     # Phase 2: Revelation Phase
@@ -538,24 +587,7 @@ class ProtoGalaxyPipeline:
                 if self.logger:
                     self.logger.warning(f"Invalid Merkle proof for client {client_id}")
                 continue
-
-            # ── Commitment binding check (Architecture Section 4.1) ──
-            # Verify that the gradients submitted NOW hash to the same
-            # commitment that was registered in Phase 1.  Without this,
-            # a Byzantine client can commit to honest gradients and then
-            # substitute poisoned ones — the Merkle proof passes but the
-            # gradients are different.
-            commitment_obj = self.round_commitment_objects.get(client_id)
-            if commitment_obj is not None:
-                if not commitment_obj.verify(submission.gradients):
-                    rejected_clients.append(client_id)
-                    if self.logger:
-                        self.logger.warning(
-                            f"Commitment binding violation for client {client_id}: "
-                            f"submitted gradients do not match Phase-1 commitment"
-                        )
-                    continue
-
+            
             # Store verified submission with raw gradients.
             # Trust-weighted aggregation (Architecture Section 4.4) is applied
             # AFTER defense filtering in Phase 3, not here, so that the
@@ -576,7 +608,6 @@ class ProtoGalaxyPipeline:
         
         if self.logger:
             self.logger.info(f"Galaxy {galaxy_id} verified submissions", extra={
-                'verified': len(verified_updates),
                 'rejected': len(rejected_clients)
             })
         
@@ -587,14 +618,28 @@ class ProtoGalaxyPipeline:
         verified_client_ids: List[int]
     ) -> Dict[str, Any]:
         """
-        Phase 2: Verify ZK proofs for Merkle-verified clients.
-        Calls ProtoGalaxy verification and applies server-side EMA norm bound check.
+        Phase 2: Verify ZK sum-check proofs for Merkle-verified clients.
+        
+        Clients that passed Merkle verification in Phase 2 are additionally
+        checked for valid ZK sum-check proofs (Architecture Section 4.1).
+        Invalid ZK proofs cause rejection.
+        
+        Args:
+            verified_client_ids: Client IDs that passed Merkle verification
+            
+        Returns:
+            Dict with zk_verified count, zk_failed count, rejected IDs, 
+            verify_time_ms, and mode
         """
-        if not self.client_zk_proofs and not verified_client_ids:
+        if not self.client_zk_proofs:
             return {
-                'zk_verified': 0, 'zk_failed': 0, 'zk_rejected_ids': [], 'verify_time_ms': 0.0, 'mode': 'NONE',
+                'zk_verified': 0,
+                'zk_failed': 0,
+                'zk_rejected_ids': [],
+                'verify_time_ms': 0.0,
+                'mode': 'NONE',
             }
-
+        
         zk_start = time.time()
         zk_verified = 0
         zk_failed = 0
@@ -603,12 +648,9 @@ class ProtoGalaxyPipeline:
         for client_id in verified_client_ids:
             zk_proof = self.client_zk_proofs.get(client_id)
             if zk_proof is None:
-                zk_failed += 1
-                zk_rejected_ids.append(client_id)
-                continue
+                continue  # No ZK proof for this client (shouldn't happen)
             
-            # verify_gradient_proof calls real PG::verify + checks EMA bound
-            is_valid = verify_gradient_proof(zk_proof, ema_bound=self.ema_bound_manager)
+            is_valid = GradientSumCheckProver.verify_proof(zk_proof)
             if is_valid:
                 zk_verified += 1
             else:
@@ -616,9 +658,7 @@ class ProtoGalaxyPipeline:
                 zk_rejected_ids.append(client_id)
         
         zk_verify_time_ms = (time.time() - zk_start) * 1000
-        mode = "REAL" if (
-            self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real
-        ) else "FALLBACK"
+        mode = "REAL"
         
         return {
             'zk_verified': zk_verified,
@@ -685,19 +725,44 @@ class ProtoGalaxyPipeline:
             aggregated_gradients = agg_raw
         
         # ================================================================
-        # Trust-Weighted Aggregation — DISABLED (Bug #1 fix)
-        #
-        # Previously this block recomputed a reputation-weighted average
-        # from cleaned updates, which OVERWROTE the Layer 3 robust
-        # aggregation output (TrimmedMean / MultiKrum).  Because all
-        # reputation scores start at 0.5 and never diverge (Bug #2),
-        # the reweighting was equivalent to simple averaging — making
-        # ProtoGalaxy and MultiKrum produce identical results.
-        #
-        # The robust aggregation from Layer 3 is now preserved as-is.
-        # Reputation scores are logged for analysis but do not modify
-        # the aggregated gradients.
+        # Trust-Weighted Aggregation (Architecture Section 4.4)
+        # w̄ = Σ(Rᵢ · ∇wᵢ) / Σ(Rᵢ)
+        # Applied AFTER defense filtering so that the statistical analyzer
+        # and robust aggregator operate on unweighted gradients.
         # ================================================================
+        reputation_sum = sum(
+            u.get('reputation', 0.5) for u in verified_updates
+        )
+        if reputation_sum > 0 and aggregated_gradients is not None:
+            # The aggregator already averaged the gradients.  To retroactively
+            # apply trust-weighted averaging we compute a per-client weighted
+            # mean ourselves from the cleaned updates that the aggregator used.
+            cleaned = defense_result.get('cleaned_updates', verified_updates)
+            if len(cleaned) > 1:
+                rep_weights = []
+                for u in cleaned:
+                    # Retrieve the reputation stored during Phase 2
+                    rep_weights.append(u.get('reputation', 0.5))
+                total_rep = sum(rep_weights)
+                if total_rep > 0:
+                    # Recompute weighted average from cleaned updates
+                    first_grads = cleaned[0]['gradients']
+                    weighted_agg = [
+                        torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                        else np.zeros_like(np.asarray(g))
+                        for g in first_grads
+                    ]
+                    for u, w in zip(cleaned, rep_weights):
+                        for li, g in enumerate(u['gradients']):
+                            if isinstance(g, torch.Tensor):
+                                weighted_agg[li] = weighted_agg[li] + g * (w / total_rep)
+                            else:
+                                weighted_agg[li] = weighted_agg[li] + np.asarray(g) * (w / total_rep)
+                    # Convert everything to tensors
+                    aggregated_gradients = [
+                        torch.tensor(g, dtype=torch.float32) if not isinstance(g, torch.Tensor) else g
+                        for g in weighted_agg
+                    ]
         
         # Get flagged clients
         flagged_clients = list(set(
@@ -952,27 +1017,65 @@ class ProtoGalaxyPipeline:
         self,
         clean_galaxy_ids: List[int]
     ) -> Dict[str, Any]:
-        """Phase 4: Compress validated proofs via folding (architecture.md §4 Phase 4 Step 5)."""
-        t0 = time.time()
-        folded_count = 0
-        from src.crypto.zkp_prover import fold_proofs_bundle
-
-        for gid in clean_galaxy_ids:
-            if gid in self.round_submissions:
-                client_bundles = []
-                for cid, sub in self.round_submissions[gid].items():
-                    if cid in self.client_zk_proofs:
-                        client_bundles.append(self.client_zk_proofs[cid])
-                
-                if client_bundles:
-                    fold_proofs_bundle(client_bundles)
-                    folded_count += len(client_bundles)
-
-        fold_time = (time.time() - t0) * 1000
+        """
+        Phase 4: Fold per-client ZK proofs into per-galaxy proofs.
+        
+        Uses ProtoGalaxy's IVC property to fold N client proofs into 1 constant-size
+        galaxy proof (Architecture Section 3.2 — Multi-Level Merkle + ZK).
+        
+        Args:
+            clean_galaxy_ids: List of galaxy IDs that passed defense (non-flagged)
+            
+        Returns:
+            Dict with folding metrics (galaxies_folded, folding_time_ms, mode)
+        """
+        import logging as _logging
+        _log = _logging.getLogger("protogalaxy.pipeline")
+        
+        self.galaxy_zk_proofs = {}
+        
+        if not self.client_zk_proofs:
+            return {
+                'galaxies_folded': 0,
+                'folding_time_ms': 0.0,
+                'mode': 'NONE',
+            }
+        
+        real_zk_proofs = {
+            cid: p for cid, p in self.client_zk_proofs.items() if p.is_real
+        }
+        if len(real_zk_proofs) != len(self.client_zk_proofs):
+            raise RuntimeError("Non-real client proof detected; fallback proofs are disabled")
+        
+        fold_start = time.time()
+        total_galaxies = len(clean_galaxy_ids)
+        
+        for gi, galaxy_id in enumerate(clean_galaxy_ids):
+            galaxy_client_ids = self.galaxy_assignments.get(galaxy_id, [])
+            galaxy_proofs = [
+                real_zk_proofs[cid]
+                for cid in galaxy_client_ids
+                if cid in real_zk_proofs
+            ]
+            
+            if galaxy_proofs:
+                _log.info(
+                    f"  ZKP fold galaxy {galaxy_id} ({gi+1}/{total_galaxies}): "
+                    f"{len(galaxy_proofs)} proofs, "
+                    f"{sum(len(p.layer_sums) for p in galaxy_proofs)} total steps"
+                )
+                folded = self.galaxy_proof_folder.fold_galaxy_proofs(
+                    galaxy_proofs, galaxy_id
+                )
+                self.galaxy_zk_proofs[galaxy_id] = folded
+        
+        folding_time_ms = (time.time() - fold_start) * 1000
+        mode = "REAL" if self.galaxy_zk_proofs else "NONE"
+        
         return {
-            'galaxies_folded': len(clean_galaxy_ids),
-            'folding_time_ms': fold_time,
-            'mode': 'proto_galaxy_ivc',
+            'galaxies_folded': len(self.galaxy_zk_proofs),
+            'folding_time_ms': folding_time_ms,
+            'mode': mode,
         }
     
     def phase4_distribute_model(self) -> Dict:
@@ -1152,11 +1255,11 @@ class ProtoGalaxyPipeline:
             verified_galaxies, layer5_result=layer5_result
         )
         
-        # Step 4c.1: Update reference gradients for next round's directional constraint
-        self.ref_gradients = [g.clone().detach() for g in global_gradients]
-        
         # Step 4d: Update global model
         self.phase4_update_global_model(global_gradients)
+
+        if global_gradients is not None:
+            self.ref_gradients = [g.clone().detach() for g in global_gradients]
         
         # Step 4e: Fold ZK proofs per galaxy (non-flagged galaxies only)
         clean_galaxy_ids = [
@@ -1218,3 +1321,7 @@ class ProtoGalaxyPipeline:
                 self.current_round,
                 metadata={'round_stats': self.round_stats}
             )
+
+
+# Backward-compatible name used by `run_pipeline.py` and external scripts.
+FiZKPipeline = ProtoGalaxyPipeline

@@ -14,12 +14,8 @@ from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from abc import ABC, abstractmethod
-
-try:
-    from flask import Flask, request, jsonify
-    FLASK_AVAILABLE = True
-except ImportError:
-    FLASK_AVAILABLE = False
+from flask import Flask, request, jsonify
+import requests
 
 
 
@@ -168,10 +164,7 @@ class GalaxyAPIServer(CommunicationAPI):
         self._running = False
         self._server_thread: Optional[threading.Thread] = None
         
-        if FLASK_AVAILABLE:
-            self.app = self._create_flask_app()
-        else:
-            self.app = None
+        self.app = self._create_flask_app()
     
     def _create_flask_app(self) -> 'Flask':
         """Create Flask application with routes"""
@@ -222,9 +215,6 @@ class GalaxyAPIServer(CommunicationAPI):
     
     def start(self):
         """Start the API server in a background thread"""
-        if not FLASK_AVAILABLE:
-            raise RuntimeError("Flask not available. Install with: pip install flask")
-        
         def run_server():
             self.app.run(host=self.host, port=self.port, threaded=True, use_reloader=False)
         
@@ -265,19 +255,10 @@ class GalaxyAPIClient:
     def __init__(self, galaxy_host: str, galaxy_port: int, timeout: float = 30.0):
         self.base_url = f"http://{galaxy_host}:{galaxy_port}"
         self.timeout = timeout
-        
-        try:
-            import requests
-            self.requests = requests
-            self._available = True
-        except ImportError:
-            self._available = False
+        self.requests = requests
     
     def submit_gradient(self, submission: GradientSubmission) -> Dict:
         """Submit gradient to galaxy server"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.post(
             f"{self.base_url}/galaxy/submit_gradient",
             json=submission.to_dict(),
@@ -287,9 +268,6 @@ class GalaxyAPIClient:
     
     def get_proof(self, client_id: str, round_number: int) -> Optional[MerkleProofResponse]:
         """Get Merkle proof from galaxy server"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.get(
             f"{self.base_url}/galaxy/proof/{client_id}",
             params={'round': round_number},
@@ -303,9 +281,6 @@ class GalaxyAPIClient:
     
     def get_status(self) -> Dict:
         """Get galaxy status"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.get(
             f"{self.base_url}/galaxy/status",
             timeout=self.timeout
@@ -345,10 +320,7 @@ class GlobalAPIServer(CommunicationAPI):
         self._running = False
         self._server_thread: Optional[threading.Thread] = None
         
-        if FLASK_AVAILABLE:
-            self.app = self._create_flask_app()
-        else:
-            self.app = None
+        self.app = self._create_flask_app()
     
     def _create_flask_app(self) -> 'Flask':
         """Create Flask application with routes"""
@@ -399,9 +371,6 @@ class GlobalAPIServer(CommunicationAPI):
     
     def start(self):
         """Start the API server"""
-        if not FLASK_AVAILABLE:
-            raise RuntimeError("Flask not available")
-        
         def run_server():
             self.app.run(host=self.host, port=self.port, threaded=True, use_reloader=False)
         
@@ -442,19 +411,10 @@ class GlobalAPIClient:
     def __init__(self, global_host: str, global_port: int, timeout: float = 30.0):
         self.base_url = f"http://{global_host}:{global_port}"
         self.timeout = timeout
-        
-        try:
-            import requests
-            self.requests = requests
-            self._available = True
-        except ImportError:
-            self._available = False
+        self.requests = requests
     
     def submit_aggregate(self, aggregate: GalaxyAggregate) -> Dict:
         """Submit galaxy aggregate to global server"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.post(
             f"{self.base_url}/global/submit",
             json=aggregate.to_dict(),
@@ -464,9 +424,6 @@ class GlobalAPIClient:
     
     def get_model(self) -> Optional[ModelBroadcast]:
         """Get global model from server"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.get(
             f"{self.base_url}/global/model",
             timeout=self.timeout
@@ -479,9 +436,6 @@ class GlobalAPIClient:
     
     def get_status(self) -> Dict:
         """Get global aggregator status"""
-        if not self._available:
-            raise RuntimeError("requests library not available")
-        
         response = self.requests.get(
             f"{self.base_url}/global/status",
             timeout=self.timeout

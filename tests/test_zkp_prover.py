@@ -15,11 +15,23 @@ import pytest
 import torch
 import numpy as np
 
-from src.crypto.zkp_prover import GradientSumCheckProver, GalaxyProofFolder, ZKProof
+from src.crypto.zkp_prover import (
+    GradientSumCheckProver,
+    GalaxyProofFolder,
+    ZKProof,
+    _ZKP_AVAILABLE,
+)
+
+pytestmark_real_zkp = pytest.mark.skipif(
+    not _ZKP_AVAILABLE,
+    reason="Requires fl_zkp_bridge (cd sonobe/fl-zkp-bridge && maturin develop --release)",
+)
 
 
 class TestTrainingStepCircuitProver:
     """Test suite for TrainingStepCircuit-based ZKP prover."""
+
+    pytestmark = pytestmark_real_zkp
 
     def test_prover_initialization(self):
         """Test that prover initializes correctly."""
@@ -116,6 +128,8 @@ class TestTrainingStepCircuitProver:
 class TestGalaxyProofFolder:
     """Test suite for folding multiple client proofs into galaxy proofs."""
 
+    pytestmark = pytestmark_real_zkp
+
     def test_fold_empty_proofs(self):
         """Test folding with no client proofs."""
         folder = GalaxyProofFolder()
@@ -166,6 +180,8 @@ class TestGalaxyProofFolder:
 
 class TestModelAgnosticOperation:
     """Test that prover works with different model architectures."""
+
+    pytestmark = pytestmark_real_zkp
 
     def test_small_mlp(self):
         """Test with small MLP gradients."""
@@ -226,35 +242,20 @@ class TestModelAgnosticOperation:
 
 
 class TestFallbackMode:
-    """Test fallback mode when Rust ZKP is not available."""
+    """Without fl_zkp_bridge, proving raises (no SHA-256 fallback)."""
 
-    def test_fallback_produces_sha256_commitment(self):
-        """Test that fallback mode produces SHA-256 commitment."""
-        # This test works regardless of whether Rust is available
-        # because fallback always works
-
-        from src.crypto.zkp_prover import _ZKP_AVAILABLE
-
-        # If Rust is available, skip (real mode tested above)
-        if _ZKP_AVAILABLE:
-            pytest.skip("Rust ZKP module available - testing real mode")
-
+    @pytest.mark.skipif(_ZKP_AVAILABLE, reason="Only when fl_zkp_bridge is not installed")
+    def test_prover_raises_without_bridge(self):
         prover = GradientSumCheckProver()
-
         gradients = [torch.randn(100) * 0.1]
-        proof = prover.prove_gradient_sum(gradients, client_id=1, round_number=1)
-
-        # Fallback should produce 32-byte SHA-256 hash
-        assert len(proof.proof_bytes) == 32
-        assert proof.is_real == False
-
-        # Verify fallback works
-        valid = GradientSumCheckProver.verify_proof(proof)
-        assert valid == True
+        with pytest.raises(RuntimeError):
+            prover.prove_gradient_sum(gradients, client_id=1, round_number=1)
 
 
 class TestByzantineResistance:
     """Test that TrainingStepCircuit provides Byzantine resistance."""
+
+    pytestmark = pytestmark_real_zkp
 
     def test_different_gradients_same_data_different_proofs(self):
         """Test that different gradient values produce different proofs."""
@@ -275,34 +276,24 @@ class TestByzantineResistance:
         assert GradientSumCheckProver.verify_proof(proof2) == True
 
     def test_proof_ties_to_specific_gradients(self):
-        """Test that proof is bound to specific gradient values."""
-        from src.crypto.zkp_prover import _ZKP_AVAILABLE
-
+        """Tampering metadata does not bypass IVC verification."""
         prover = GradientSumCheckProver()
 
         gradients = [torch.randn(100) * 0.5]
         proof = prover.prove_gradient_sum(gradients, client_id=1, round_number=1)
 
-        # Verify with same gradients should succeed
-        assert GradientSumCheckProver.verify_proof(proof) == True
+        assert GradientSumCheckProver.verify_proof(proof) is True
 
-        # In fallback mode, verify that tampering is detected
-        if not _ZKP_AVAILABLE:
-            # Modify layer_sums in proof - verification should fail (fallback mode)
-            modified_layer_sums = [ls + 999.0 for ls in proof.layer_sums]
-            modified_proof = ZKProof(
-                proof_bytes=proof.proof_bytes,
-                claimed_sum=proof.claimed_sum,
-                num_steps=proof.num_steps,
-                client_id=proof.client_id,
-                round_number=proof.round_number,
-                prove_time_ms=proof.prove_time_ms,
-                is_real=proof.is_real,
-                layer_sums=modified_layer_sums,  # Tampered layer sums
-            )
-
-            result = GradientSumCheckProver.verify_proof(modified_proof)
-            assert result == False, "Fallback mode should detect tampered layer_sums"
-        else:
-            # In real mode, verify works via IVC folding - just confirm proof exists
-            assert len(proof.proof_bytes) > 0, "Real mode should produce non-empty proof"
+        modified_layer_sums = [ls + 999.0 for ls in proof.layer_sums]
+        modified_proof = ZKProof(
+            proof_bytes=proof.proof_bytes,
+            claimed_sum=proof.claimed_sum,
+            num_steps=proof.num_steps,
+            client_id=proof.client_id,
+            round_number=proof.round_number,
+            prove_time_ms=proof.prove_time_ms,
+            is_real=proof.is_real,
+            layer_sums=modified_layer_sums,
+            gradient_bundle=proof.gradient_bundle,
+        )
+        assert GradientSumCheckProver.verify_proof(modified_proof) is True

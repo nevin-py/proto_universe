@@ -1,318 +1,318 @@
-FiZK: System Architecture and Programming Specification
+FiZK: Master Architecture Blueprint (Technical Specification)
 
-This document details the configuration, cryptographic circuit design, execution flow, and evaluation setup of the FiZK (Federated Integrity with Zero Knowledge) protocol. It incorporates the $L_2$ norm (Sum-of-Squares) R1CS patch, the EMA-based Sybil mitigation strategy, in-circuit directional filtering, and practical engineering constraints required for real-world deployment.
+System: Federated Integrity with Zero Knowledge (FiZK)
+Core Technologies: ProtoGalaxy IVC, PyTorch, Rust (Sonobe/Arkworks), Multi-Krum
+Objective: Verifiable, Byzantine-robust Hierarchical Federated Learning
 
-1. System Configuration & Hyperparameters
+1. Formal System Philosophy & Threat Model
 
-Cryptographic Stack
+FiZK addresses the Proof-of-Training Gap. Let $\mathcal{D}_i$ be the private dataset of client $i$, and $\mathcal{L}(w, \mathcal{D}_i)$ be the loss function. Fully Verifiable Training requires proving $\nabla w_i = \nabla \mathcal{L}(w^{(t)}, \mathcal{D}_i)$ inside a ZK-SNARK, resulting in $O(|\mathcal{D}_i| \cdot |w|)$ constraints, which is computationally intractable for edge devices.
 
-IVC Scheme: ProtoGalaxy (via Sonobe library).
+Instead, FiZK functions as a cryptographic Property Checker. It enforces a hard bounded space $\Omega^{(t)}$ in $\mathbb{R}^d$ for round $t$.
+Let $g_i \in \mathbb{R}^d$ be the submitted gradient. FiZK guarantees:
 
-Elliptic Curve Cycle: BN254 / Grumpkin (natively supports efficient folding).
+Magnitude: $\|g_i\|_2^2 \leq B_l^2$
 
-Commitment Scheme: SHA-256 (Client-side Merkle Leaves), Pedersen Commitments (Inside ZK).
+Direction: $\langle g_i, \nabla w_{ref} \rangle \ge 0$
 
-Circuit Chunk Size ($C$): 2048 parameters per fold step. (This drastically reduces IVC folding overhead by shifting the bottleneck from CPU-bound step verification to RAM-bound circuit size, bringing a 62K parameter LeNet-5 model from ~1,240 folding steps down to just 31 steps).
+By restricting the Byzantine attacker's action space to $\Omega^{(t)}$ cryptographically (Layer 1), the downstream statistical aggregators (Layer 2) can successfully operate under high Byzantine fractions ($\alpha \ge 0.50$) without succumbing to dimension-curse scale inflation or strict sign-inversion.
 
-Zero-Knowledge Relation: Relaxed R1CS.
+2. The Cryptographic Engine (Relaxed R1CS & ProtoGalaxy)
 
-Practical Engineering Parameters
+The integrity engine, GradientFingerprintCircuit<F>, is constructed over the BN254 elliptic curve scalar field $\mathbb{F}_p$, where $p \approx 2^{254}$. The circuit uses a uniform step function $F: z_i \times x_i \to z_{i+1}$ folded via ProtoGalaxy Incrementally Verifiable Computation (IVC).
 
-Quantization Scale Factor: $10^6$ (Maps FP32 floats to finite field integers $\mathbb{F}_p$). Note: Squared norm accumulations will scale by $10^{12}$, which is safely within the BN254 scalar field capacity ($\approx 2^{254}$).
+2.1 The State Vector $\vec{z}_i \in \mathbb{F}_p^7$
 
-Padding Strategy: Zero-padding (Pads gradient vectors until length % 2048 == 0).
+The IVC step circuit maintains a strict 7-element state accumulator across every folding step $k$:
 
-Local Environment Optimizations (Rust/Maturin)
+$z_i \leftarrow model\_fp$: Binds proof to the public global model hash.
 
-Because evaluation and testing are performed on a local computer, the heavy cryptographic Multi-Scalar Multiplications (MSMs) must be optimized for the host CPU to achieve realistic proving times:
+$z_i \leftarrow ref\_grad\_fp$: Binds proof to the public reference gradient hash.
 
-Parallelism (Rayon): The ark-ff and ark-ec (Arkworks) dependencies are compiled with the parallel feature enabled. This allows the Sonobe prover to automatically distribute polynomial commitments and MSMs across all available CPU cores on the local machine.
+$z_i \leftarrow grad\_fp\_accum$: Accumulates $\sum (r_j \cdot g_j) \pmod p$.
 
-Instruction Set Targeting: The Rust environment is configured with RUSTFLAGS="-C target-cpu=native". This allows the compiler to utilize advanced local hardware vector instructions (e.g., AVX2 or AVX-512) for finite field arithmetic.
+$z_i \leftarrow norm\_sq\_accum$: Accumulates $\sum (g_j^2) \pmod p$.
 
-Release Mode: The Python-Rust bridge is exclusively compiled using maturin develop --release. Debug builds drop performance by over 10x and must not be used for benchmarking.
+$z_i \leftarrow dir\_fp\_accum$: Accumulates $\sum (g_j \cdot ref_j) \pmod p$.
 
-Federated Learning Stack
+$z_i \leftarrow ref\_fp\_accum$: Accumulates $\sum (r_j \cdot ref_j) \pmod p$.
 
-Aggregation Algorithm: Multi-Krum + Cosine Similarity.
+$z_i \leftarrow step\_count$: Arithmetic counter $k \pmod p$.
 
-Norm Bound Baseline: 25th Percentile ($Q_{0.25}$) of client norms.
+2.2 R1CS Constraint Complexity ($C = 2048$)
 
-Sybil EMA Momentum ($\beta$): 0.9.
+In R1CS, linear combinations (addition) are free ($0$ constraints). Only multiplications $A \cdot B = C$ incur a constraint cost. For a chunk size of $C = 2048$, the per-step constraint generation is highly optimized:
 
-Tolerance Multiplier ($\gamma$): 5.0.
+$g_j^2$ (Norm): $1$ constraint per parameter.
 
-Reputation Decay ($\lambda$): 0.1.
+$r_j \cdot g_j$ (Gradient Hash): $1$ constraint per parameter.
 
-Directional Threshold: 0 (Used to block negative inner products, mathematically guaranteeing an angle $\le 90^\circ$ between the client gradient and the global reference trajectory).
+$g_j \cdot ref_j$ (Direction): $1$ constraint per parameter.
 
-2. ZK Circuit Architecture (Rust / Sonobe)
+$r_j \cdot ref_j$ (Reference Hash): $1$ constraint per parameter.
+Total Step Complexity: $4C \approx 8,192$ constraints per fold step.
 
-The core integrity engine is the GradientFingerprintCircuit<F>, implemented in Rust. It utilizes a uniform step circuit that computes three critical cryptographic bounds: the gradient fingerprint, the $L_2$ norm squared (magnitude limit), and the reference inner product (directional limit).
+For a $d=62,000$ parameter CNN, IVC reduces a monolithic $\sim 250,000$ constraint circuit into exactly $31$ sequential folding steps of $8,192$ constraints, heavily optimizing RAM usage and parallelization.
 
-2.1 State Vector (The Accumulators)
+2.3 The Decider Constraints
 
-At step $i$, the circuit takes the state $z_i$ and outputs $z_{i+1}$:
+After $K = \lceil d / C \rceil$ steps, the final state $z_{K}$ is evaluated in the Decider Circuit:
 
-pub struct CircuitState<F: PrimeField> {
-    pub model_fp: F,               // Immutable: Binds to the global server's model
-    pub ref_grad_fp: F,            // Immutable: Binds the public reference gradient to prevent spoofing
-    pub grad_fp_accum: F,          // Accumulates: <r_chunk, g_chunk>
-    pub norm_sq_accum: F,          // Accumulates: sum(g_j^2) for magnitude bounding
-    pub directional_fp_accum: F,   // Accumulates: <g_chunk, ref_chunk> for directional bounding
-    pub step_count: F,             // Accumulates: +1 per fold
+Magnitude Limit: cs.enforce_cmp(z_K, B_l_sq, LessThanOrEq)
+
+Direction Limit: cs.enforce_cmp(z_K, F::ZERO, GreaterThanOrEq)
+
+Spoof Protection: cs.enforce_eq(z_K, z_K)
+
+2.4 Sonobe FCircuit Implementation (Rust Code Depth)
+
+To utilize Sonobe's ProtoGalaxy implementation, the core logic is encapsulated in the FCircuit trait using ark_r1cs_std for finite field constraint generation.
+
+use ark_r1cs_std::prelude::\*;
+use folding_schemes::frontend::FCircuit;
+
+#[derive(Clone, Debug)]
+pub struct GradientFingerprintCircuit<F: PrimeField> {
+pub chunk_size: usize,
+pub \_f: std::marker::PhantomData<F>,
 }
 
+impl<F: PrimeField> FCircuit<F> for GradientFingerprintCircuit<F> {
+type Params = ();
 
-2.2 R1CS Step Logic (prove_chunk)
+    fn state_len(&self) -> usize { 7 }
+    fn external_inputs_len(&self) -> usize { self.chunk_size * 3 } // r, g, ref_g
 
-For each chunk of 2048 gradients, the circuit enforces the following R1CS constraints. Providing the ref_chunk (the aggregated global gradient from round $t-1$) allows the circuit to mathematically block sign-flipping.
+    fn generate_step_constraints(
+        &self,
+        cs: ConstraintSystemRef<F>,
+        _i: usize,
+        z_i: Vec<FpVar<F>>,
+        external_inputs: Vec<FpVar<F>>,
+    ) -> Result<Vec<FpVar<F>>, SynthesisError> {
 
-Cryptographic Note on Cosine Similarity: Calculating true cosine similarity ($\frac{A \cdot B}{||A|| ||B||}$) requires division and square roots, which are highly inefficient in R1CS. Because FiZK already bounds the magnitude ($L_2$ norm), the circuit only needs to compute the raw inner product. Bounding this inner product $\ge 0$ serves as a highly efficient, division-free proxy for Cosine Similarity.
+        // 1. Unpack state z_i
+        let model_fp = &z_i;
+        let ref_grad_fp = &z_i;
+        let mut grad_fp_accum = z_i.clone();
+        let mut norm_sq_accum = z_i.clone();
+        let mut dir_fp_accum = z_i.clone();
+        let mut ref_fp_accum = z_i.clone();
+        let step_count = &z_i;
 
-// Pseudo-code for Sonobe R1CS constraint generation
-fn synthesize_step(
-    &self, 
-    cs: &mut ConstraintSystem<F>, 
-    z_in: CircuitState<F>, 
-    r_chunk: Vec<F>, 
-    g_chunk: Vec<F>,
-    ref_chunk: Vec<F>
-) -> Result<CircuitState<F>, Error> {
-    
-    let mut current_grad_fp = z_in.grad_fp_accum;
-    let mut current_norm_sq = z_in.norm_sq_accum;
-    let mut current_dir_fp = z_in.directional_fp_accum;
+        // 2. Unpack External Inputs (Witnesses)
+        let r_chunk = &external_inputs[0..self.chunk_size];
+        let g_chunk = &external_inputs[self.chunk_size..self.chunk_size*2];
+        let ref_chunk = &external_inputs[self.chunk_size*2..self.chunk_size*3];
 
-    for j in 0..CHUNK_SIZE { // CHUNK_SIZE = 2048
-        // 1. Fingerprint Constraint: grad_fp += r_j * g_j
-        let r_times_g = cs.mul(r_chunk[j], g_chunk[j]);
-        current_grad_fp = cs.add(current_grad_fp, r_times_g);
+        // 3. Apply R1CS Constraints for the current chunk
+        for j in 0..self.chunk_size {
+            // grad_fp_accum += r_j * g_j
+            let r_g = r_chunk[j].clone() * g_chunk[j].clone();
+            grad_fp_accum = grad_fp_accum + r_g;
 
-        // 2. Magnitude Constraint: norm_sq += g_j * g_j
-        let g_squared = cs.mul(g_chunk[j], g_chunk[j]); 
-        current_norm_sq = cs.add(current_norm_sq, g_squared);
+            // norm_sq_accum += g_j * g_j
+            let g_sq = g_chunk[j].clone() * g_chunk[j].clone();
+            norm_sq_accum = norm_sq_accum + g_sq;
 
-        // 3. Directional Constraint: dir_fp += g_j * ref_j (Blocks sign flips)
-        let g_times_ref = cs.mul(g_chunk[j], ref_chunk[j]);
-        current_dir_fp = cs.add(current_dir_fp, g_times_ref);
+            // dir_fp_accum += g_j * ref_j
+            let g_ref = g_chunk[j].clone() * ref_chunk[j].clone();
+            dir_fp_accum = dir_fp_accum + g_ref;
+
+            // ref_fp_accum += r_j * ref_j
+            let r_ref = r_chunk[j].clone() * ref_chunk[j].clone();
+            ref_fp_accum = ref_fp_accum + r_ref;
+        }
+
+        // 4. Construct z_{i+1}
+        let one = FpVar::Constant(F::one());
+        let next_step = step_count.clone() + one;
+
+        Ok(vec![
+            model_fp.clone(),
+            ref_grad_fp.clone(),
+            grad_fp_accum,
+            norm_sq_accum,
+            dir_fp_accum,
+            ref_fp_accum,
+            next_step,
+        ])
     }
 
-    // Return z_{i+1}
-    Ok(CircuitState {
-        model_fp: z_in.model_fp, 
-        ref_grad_fp: z_in.ref_grad_fp,
-        grad_fp_accum: current_grad_fp,
-        norm_sq_accum: current_norm_sq,
-        directional_fp_accum: current_dir_fp,
-        step_count: cs.add(z_in.step_count, F::ONE),
-    })
 }
 
+2.5 ProtoGalaxy IVC Proving and Decider Pipeline
 
-2.3 The Decider Check (Post-Fold Verification)
+The Rust FFI bridge utilizes Sonobe's ProtoGalaxy and Decider traits to execute the folding scheme across the chunks provided by the Python runtime.
 
-Once the folding is complete, the final Decider circuit enforces both safety bounds (Magnitude and Direction).
+// Type aliases mapping the BN254 curve to ProtoGalaxy
+type Projective = ark_bn254::G1Projective;
+type PG = ProtoGalaxy<Projective, GradientFingerprintCircuit<Fr>>;
+type Decider = DeciderEth<Projective, GradientFingerprintCircuit<Fr>>;
 
-// In the final Decider / Verification Phase
+pub fn generate_ivc_proof(
+z_0: Vec<Fr>,
+chunks: Vec<Vec<Fr>> // Batched [r, g, ref] chunks
+) -> Result<Vec<u8>, Error> {
 
-// 1. Prevent Exploding Gradients & Sum-to-Zero bypass
-cs.enforce_less_than_or_equal(z_final.norm_sq_accum, B_l_squared);
+    // 1. Setup & Circuit Initialization
+    let circuit = GradientFingerprintCircuit { chunk_size: 2048, _f: PhantomData };
+    let (prover_params, verifier_params) = PG::setup(..., &circuit)?;
 
-// 2. Prevent Sign-Flipping & Directional Attacks (Requires angle <= 90 degrees)
-// A threshold of F::ZERO ensures the vector is not pointing in the opposite direction.
-cs.enforce_greater_than_or_equal(z_final.directional_fp_accum, F::ZERO);
+    // 2. Initialize IVC State
+    let mut ivc_state = PG::init(&prover_params, circuit, z_0.clone())?;
 
+    // 3. Execute Folding Loop
+    for external_inputs in chunks {
+        // Absorbs the step into the folded accumulator
+        ivc_state = PG::prove_step(ivc_state, external_inputs)?;
+    }
 
-3. Python-Side Pipeline & Algorithms
+    // 4. Finalize with Decider
+    // The decider wraps the final folded state into a verifiable SNARK
+    let decider_proof = Decider::prove(&prover_params, ivc_state)?;
 
-3.1 Dynamic Bound Calculation (EMA)
+    // Serialize to bytes for transmission to Aggregator
+    Ok(serialize_bundle(decider_proof, ivc_state.z_i))
 
-To prevent Sybil attacks from artificially inflating the bound, the Global Server calculates the bound using an Exponential Moving Average.
+}
 
-def calculate_dynamic_bound(client_norms, previous_bound, beta=0.9, gamma=5.0):
-    """
-    Calculates the $L_2$ norm threshold for the next round.
-    """
-    q_25 = np.percentile(client_norms, 25)
-    current_target = q_25 * (1 + gamma)
-    
-    if previous_bound is None:
-        return current_target
-        
-    # EMA Calculation
-    new_bound = (beta * previous_bound) + ((1 - beta) * current_target)
-    return new_bound
+3. Python-to-Rust FFI Bridge & Finite Field Mapping
 
+Neural network gradients are in FP32. To map these into the BN254 scalar field $\mathbb{F}_p$ while preserving negative values and avoiding float-truncation, FiZK implements a rigorous bijective mapping.
 
-3.2 Galaxy Aggregator: Defense Pipeline
+3.1 Strict Quantization & Field Wrapping
 
-def process_galaxy_updates(client_payloads, R_g, B_l_squared, public_ref_hash):
-    valid_clients = []
-    
-    for payload in client_payloads:
-        client_id, plaintext_grad, zkp_bundle, nonce = payload
-        
-        # 1. Merkle Lock Check
-        h_i = sha256(plaintext_grad, global_seed, nonce)
-        if not verify_merkle_leaf(h_i, R_g):
-            penalize_reputation(client_id)
-            continue
-            
-        # 2. Public IO Check (Ensures client didn't spoof bounds or reference vectors)
-        if not verify_public_inputs(zkp_bundle, plaintext_grad, B_l_squared, public_ref_hash):
-            penalize_reputation(client_id)
-            continue
-            
-        valid_clients.append((client_id, plaintext_grad, zkp_bundle))
+Let $\eta = 6$ be the quantization scale factor. For every parameter $g \in \mathbb{R}$:
 
-    # 3. Statistical Filtering (Cosine -> Multi-Krum)
-    filtered_clients = apply_cosine_similarity_filter(valid_clients)
-    final_m_clients = apply_multi_krum(filtered_clients)
-    
-    # 4. Aggregation and Folding (Cryptographic Absorption)
-    w_g = compute_mean([c for c in final_m_clients])
-    pi_g_fold = fold_proofs_ivc([c for c in final_m_clients]) # Rust PG::fold
-    
-    return w_g, pi_g_fold
+$$\tilde{g} = \lfloor g \times 10^\eta \rceil$$
 
+If $\tilde{g} < 0$, it is wrapped in the finite field as $\tilde{g}_{\mathbb{F}_p} = p - |\tilde{g}|$.
 
-4. End-to-End Execution Flow (The 4 Phases)
+3.2 Dynamic Decider Scaling
 
-Phase 0: Initialization & "Cold Start"
+Because the R1CS circuit computes the $L_2$ norm on quantized parameters, the scalar sum-of-squares operates in the scaled space. The Python server must scale the dynamic bound before passing it as a public input to the verifier:
 
-Cold Start: In Round $t=0$, there are no client norms to establish $Q_{0.25}$. $B_l^{(0)}$ is initialized via a pre-defined hyperparameter derived from a warm-up epoch on public data. The reference_grad is set to an array of ones (or initial weights) to permit initial exploration.
+$$B_{ZK}^2 = B_l^2 \times 10^{2\eta}$$
 
-Phase 1: Commitment and ZKP Generation (Edge Client)
+This $10^{12}$ scaling is safely contained within $\mathbb{F}_p$ capacity ($2^{254} \approx 10^{76}$), guaranteeing no cryptographic overflow.
 
-Receive Context: Client receives global model $w^{(t)}$, random challenge seed $r^{(t)}$, reference gradient $\nabla w_{ref}$, its public hash, and dynamic bounds.
+3.3 Memory Layout & Padding
 
-Local Training: Execute local SGD to compute $\nabla w_i$.
+To satisfy $K \times C = d_{padded}$, Python zero-pads the flattened 1D gradient vector:
 
-Quantization & Padding:
+$$pad\_len = (2048 - (d \pmod{2048})) \pmod{2048}$$
 
-Multiply $\nabla w_i$ and $\nabla w_{ref}$ by $10^6$ and map to $\mathbb{F}_p$.
+Tensors are passed across the FFI boundary as contiguous C memory arrays (numpy.ndarray(dtype=np.int64)) natively converting to Rust Vec<i64>.
 
-Append zeroes until length is divisible by $C=2048$.
+4. The Statistical Defense Engine
 
-ZK Proving: Call ModelAgnosticProver.generate_proof().
+4.1 Sybil-Resistant Exponential Moving Average (EMA)
 
-Runs ProtoGalaxy IVC to generate $\pi_i^{zk}$. Fails natively if magnitude exceeds $(B_l^{(t)})^2$ or if the directional inner product falls below 0.
+To calculate $B_l$, the global server measures the true un-rooted $L_2$ norm of accepted gradients. To prevent Sybil adversaries ($\alpha \ge 0.50$) from manipulating the threshold, the bound $B_l^{(t)}$ is anchored to historical data via momentum $\beta = 0.9$:
 
-Commit: Compute $h_i = \text{SHA-256}(\text{Quantized}(\nabla w_i) \,\|\, r^{(t)} \,\|\, \text{nonce}_i)$.
+$$Q_{0.25}^{(t)} = \text{Percentile}_{25}\left(\{ \|g_i\|_2 \}_{i=1}^n\right)$$
 
-Transmit 1: Send (client_id, h_i, pi_i_zk) to Galaxy Aggregator.
+$$B_l^{(t)} = \beta B_l^{(t-1)} + (1-\beta) \left[ Q_{0.25}^{(t)} \times (1 + \gamma) \right]$$
 
-Phase 2: Gradient Revelation & ZK-Firewall (Galaxy Aggregator)
+By anchoring at the 25th percentile, the system remains in the honest statistical regime as long as honest clients $\ge 25\%$.
 
-Construct Tree: Aggregator builds Merkle Tree from all $h_i$, publishes root $R_g^{(t)}$.
+4.2 Multi-Krum Scoring Function
 
-Transmit 2: Clients reveal (plaintext_grad, nonce_i).
+For gradients surviving the ZK-Firewall, the Galaxy Aggregator computes the pairwise Euclidean distance matrix. For client $i$, its score $s_i$ is the sum of distances to its $n - f - 2$ closest neighbors (where $f$ is the estimated Byzantine limit):
 
-Privacy Note: In a production deployment, this step uses Secure Aggregation (SecAgg). Clients transmit gradients combined with cryptographic masks. The ZK proof attests to the unmasked integrity, while the Aggregator only sees the masked sum.
+$$s_i = \sum_{g_j \in \mathcal{N}_i} \| g_i - g_j \|_2^2$$
 
-Layer 1 Defense (Cryptographic IO Check):
+The aggregator selects the $m$ gradients with the lowest scores $s_i$ for final aggregation $\bar{w}_g = \frac{1}{m}\sum g_{selected}$.
 
-Assert SHA-256(plaintext_grad...) == h_i.
+5. Formal Protocol Flow
 
-Assert public variables in $\pi_i^{zk}$ match plaintext_grad fingerprint and public_ref_hash. Full cryptographic verification is deferred to the folding step.
+Phase 0: Context Initialization
 
-Phase 3: Defense & Folding (Galaxy Aggregator)
+Server broadcasts $w^{(t)}$, random Fiat-Shamir seed $r^{(t)}$, scaling threshold $B_{ZK}^2$, and reference vector $\nabla w_{ref} = \bar{w}_{global}^{(t-1)}$.
 
-Layer 2 & 3 Defenses: Execute server-side Cosine Similarity and Multi-Krum to prune minor statistical anomalies.
+Phase 1: Commitment & Proof Generation
 
-Aggregate: Compute $\bar{w}_g = \frac{1}{m} \sum_{k=1}^m \nabla w_k$.
+Client evaluates $\tilde{g}_i = \text{quantize}(\nabla \mathcal{L}(w^{(t)}, \mathcal{D}_i))$.
 
-Fold (The true Verification): Execute ProtoGalaxy fold() on the $m$ valid pi_i_zk bundles. This cryptographically absorbs and verifies the proofs, producing a constant-size $\pi_g^{\mathsf{fold}}$.
+Client computes ZK-IVC proof $\pi_i^{zk}$ over $\tilde{g}_i$ asserting membership in $\Omega^{(t)}$ using the ProtoGalaxy::prove_step pipeline.
 
-Transmit 3: Send (w_g, pi_g_fold, R_g) to Global Server.
+Client computes cryptographic binding: $h_i = \text{SHA256}(\tilde{g}_i \parallel r^{(t)} \parallel \text{nonce}_i)$.
 
-Phase 4: Global Verification & Update (Global Server)
+Client transmits $\{ID_i, h_i, \pi_i^{zk}\}$ to Galaxy Aggregator.
 
-Verify Integrity:
+Phase 2: Revelation & Firewall Verification
 
-Construct Global Merkle Tree.
+Aggregator locks round, building Merkle Tree $\mathcal{M}$ over $\{h_i\}_{i=1}^n$ with root $R_g$.
 
-Execute $O(1)$ IVC verification on each $\pi_g^{\mathsf{fold}}$.
+Client transmits plaintext $\{\tilde{g}_i, \text{nonce}_i\}$.
 
-Global Update: Apply valid, de-quantized galaxy gradients to $w^{(t)}$.
+L1 Firewall: Aggregator asserts $\text{SHA256}(\dots) \equiv h_i$. Extracts public output state $\vec{z}_K$ of $\pi_i^{zk}$ and ensures it perfectly matches $B_{ZK}^2$ and public Fiat-Shamir hashes.
 
-Update Contexts: Extract new $L_2$ norms, apply EMA to update $B_l^{(t+1)}$, and set the new aggregated gradient as $\nabla w_{ref}$ for Round $t+1$.
+Phase 3: Selection & Compression
 
-5. Experimental Setup & Evaluation Metrics
+L2 Defense: Aggregator executes Multi-Krum on validated $\{\tilde{g}_i\}$.
 
-To thoroughly validate FiZK, the evaluation compares its performance against established baselines under diverse attack scenarios.
+Aggregator computes Galaxy mean $\bar{w}_g$.
 
-5.1 Defense Baselines
+IVC Fold: Aggregator applies the ProtoGalaxy non-interactive folding scheme $\mathcal{F}$ over all client bundles:
 
-Vanilla FedAvg: No defense (Establishes the lower bound / attack effectiveness).
+$$\pi_g^{\mathsf{fold}} = \mathcal{F}(\pi_1^{zk}, \mathcal{F}(\pi_2^{zk}, \dots \mathcal{F}(\pi_{m-1}^{zk}, \pi_m^{zk})\dots))$$
 
-Multi-Krum: Standard robust aggregation based on Euclidean distance filtering.
+Transmits $\{\bar{w}_g, \pi_g^{\mathsf{fold}}, R_g\}$ to Server.
 
-FLTrust: A state-of-the-art defense relying on a trusted root dataset (to benchmark FiZK's root-free approach).
+Phase 4: $O(1)$ Global State Update
 
-FiZK (Ours): Full proposed architecture (ZKP + Multi-Krum + Cosine).
+Server verifies $\pi_g^{\mathsf{fold}}$ via the DeciderEth::verify method. Verification complexity is strictly $O(1)$ with respect to client count $m$.
 
-5.2 Datasets & Models
+Server incorporates $\bar{w}_g \to w^{(t+1)}$ and updates parameters.
 
-Linear Task: MNIST dataset evaluated on a single-layer Linear Classifier.
+6. Threat Model & Theoretical Boundaries
 
-Deep Task: Fashion-MNIST dataset evaluated on a LeNet-5 CNN (trained from scratch).
+Attack Vector
 
-Distributions: Both IID and Dirichlet Non-IID ($\beta=0.5$).
+Countermeasure
 
-5.3 Attack Threat Model
+Mathematical Bound / Mechanism
 
-Simulate the following attacks varying Byzantine fractions ($\alpha \in \{0.30, 0.50, 0.60\}$):
+Bait-and-Switch
 
-Model Poisoning (Scaling): Gradients multiplied by large malicious factors. (Blocked natively by $L_2$ bound).
+Merkle Lock
 
-Sign-Flip Attack: $\nabla w_{malicious} = -1 \times \nabla w_{honest}$. (Blocked natively by in-circuit directional check).
+Cryptographic Hash pre-image collision resistance.
 
-Gaussian Noise Attack: Gradients replaced with vectors drawn from $\mathcal{N}(0, \sigma^2)$.
+Exploding Gradients
 
-Label Flipping Attack: Local data labels inverted (e.g., $y_{malicious} = 9 - y_{honest}$).
+ZK Magnitude Check
 
-5.4 Mandatory Data & Metrics to Gather
+Ensures $g_i \in \mathbb{R}^d$ bounded by hypersphere radius $B_l$.
 
-For each experiment, collect the following precise metrics (average across 3 random seeds):
+Sign-Flipping
 
-1. Machine Learning Metrics (Effectiveness):
+ZK Directional Check
 
-Global Test Accuracy (%): Final accuracy of the global model after $T$ rounds.
+Restricts to half-space: $\langle g_i, \nabla w_{ref} \rangle \ge 0$.
 
-Byzantine Detection Rate:
+Reference Spoofing
 
-TPR (True Positive Rate): % of malicious clients correctly dropped.
+In-Circuit Anti-Spoof
 
-FPR (False Positive Rate): % of honest clients accidentally dropped.
+$\sum (r_j \cdot ref_j) \equiv Hash(ref\_public)$.
 
-F1-Score: Harmonic mean of Precision and Recall for detecting Byzantine clients.
+Sybil Inflation
 
-2. Cryptographic/System Metrics (Efficiency):
+EMA Bound Smoothing
 
-Client Proving Time (ms): Time taken to run generate_proof(). Compare standard SGD time vs SGD + ZKP time to establish the computational $\Delta$.
+Requires $\alpha > 0.75$ sustained over $T \to \infty$ rounds to diverge.
 
-Aggregator Folding Time (ms): Time taken to fold $m$ proofs.
+Semantic Data Poisoning
 
-Global Server Verification Time (ms): Time taken to verify the $O(1)$ folded instance.
+Multi-Krum / Median
 
-Proof Size Overhead (KB/MB): Network bandwidth consumed by raw client proofs vs. the compressed $\pi_g^{\mathsf{fold}}$.
+$O(d)$ outlier pruning within the accepted ZK cryptographic hypersphere.
 
-6. Security Limitations & Defense-in-Depth Context
+7. Known Theoretical Limitations
 
-This architecture explicitly acknowledges the boundaries of applied zero-knowledge proofs in modern Machine Learning via a defense-in-depth paradigm.
+Orthogonal Backdoors ($\theta \to 90^\circ$): The directional constraint $\langle g_i, \nabla w_{ref} \rangle = \|g_i\|\|\nabla w_{ref}\| \cos(\theta) \ge 0$ restricts the attacker to the positive half-space. An attacker can submit a poisoned vector perfectly orthogonal to the reference ($\cos(89.9^\circ) \approx 0$). While ZK-approved, these are structurally distinct and are mitigated downstream by Multi-Krum.
 
-6.1 The "Proof-of-Training" Gap vs. Property Checking
-
-The GradientFingerprintCircuit mathematically functions as a Property Checker. It irrefutably proves the mathematical properties of a submitted vector (its bounded magnitude and its directional alignment with the global trajectory). However, it does not provide Computation Provenance Checking. The circuit cannot mathematically prove that the client obtained gradient $g$ by running actual Stochastic Gradient Descent (SGD) on their private dataset.
-
-Achieving fully Verifiable Training (compiling the forward pass, loss calculation, and backpropagation of a 62K parameter model over multiple epochs into an R1CS circuit) remains computationally prohibitive for edge devices. Consequently, a malicious client can submit an arbitrary gradient $g'$ provided they successfully engineer it to pass the magnitude and directional thresholds.
-
-6.2 Defense-in-Depth Mitigation
-
-To address this gap, FiZK pairs strict cryptographic property bounds with statistical aggregation layers (Multi-Krum).
-
-The ZK-Firewall acts as a hard cryptographic limit, eliminating the most catastrophic attacks (exploding gradients, sign-inversions) that typically collapse statistical aggregators.
-
-The Aggregator Algorithms act as semantic filters, discarding gradients that conform to the cryptographic rules but deviate maliciously in distribution (e.g., highly crafted label-flipping vectors). By restricting the search space available to an attacker with ZKPs, the statistical aggregators are heavily protected and can successfully tolerate Byzantine majorities ($\alpha \ge 50\%$).
+Privacy vs. Integrity (DLG Vulnerability): The protocol mandates plaintext revelation to the Aggregator for Merkle verification, leaving clients susceptible to Deep Leakage from Gradients (DLG). Future iterations must compose the IVC proof with Secure Aggregation (SecAgg) secret-sharing primitives.

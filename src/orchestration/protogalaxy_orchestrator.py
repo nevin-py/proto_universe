@@ -78,7 +78,7 @@ class ProtoGalaxyOrchestrator:
         self.global_merkle_tree: Optional[GlobalMerkleTree] = None
         
         # ZKP infrastructure
-        self.zkp_prover = GradientSumCheckProver()
+        self.zkp_prover = GradientSumCheckProver(model)
         self.galaxy_proof_folder = GalaxyProofFolder()
         self.client_zk_proofs: Dict[int, ZKProof] = {}
         self.galaxy_zk_proofs: Dict[int, ZKProof] = {}
@@ -259,7 +259,7 @@ class ProtoGalaxyOrchestrator:
                 zk_proofs_generated += 1
                 zk_total_time_ms += zk_proof.prove_time_ms
             
-            mode = "REAL (ProtoGalaxy IVC)" if self.client_zk_proofs and next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK (SHA-256)"
+            mode = "REAL (ProtoGalaxy IVC)"
             logger.info(f":) ZK proofs: {zk_proofs_generated} generated [{mode}]")
             logger.info(f"  Total prove time: {zk_total_time_ms:.1f}ms ({zk_total_time_ms/max(zk_proofs_generated,1):.1f}ms/client)")
         else:
@@ -392,7 +392,7 @@ class ProtoGalaxyOrchestrator:
                 verification_results[cid] = False
             
             zk_verify_time_ms = (_time.time() - zk_start) * 1000
-            mode = "REAL" if next(iter(self.client_zk_proofs.values())).is_real else "FALLBACK"
+            mode = "REAL"
             logger.info(f":) ZK verification [{mode}]: {zk_verified} valid, {zk_failed} invalid ({zk_verify_time_ms:.1f}ms)")
         
         logger.info(f":) Verified: {len(verified_updates)}/{len(client_updates)} clients ({acceptance_rate:.1%})")
@@ -582,7 +582,7 @@ class ProtoGalaxyOrchestrator:
                     self.galaxy_zk_proofs[galaxy_id] = folded
             
             folding_time_ms = (_time.time() - fold_start) * 1000
-            mode = "REAL" if self.galaxy_zk_proofs and next(iter(self.galaxy_zk_proofs.values())).is_real else "FALLBACK"
+            mode = "REAL" if self.galaxy_zk_proofs else "NONE"
             logger.info(f":) Galaxy proofs folded [{mode}]: {len(self.galaxy_zk_proofs)} galaxies ({folding_time_ms:.1f}ms)")
         
         return PhaseResult(

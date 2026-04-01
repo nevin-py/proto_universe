@@ -108,9 +108,9 @@ class DefenseCoordinator:
                     server_epochs=config.get('fltrust_server_epochs', 1),
                 )
             else:
-                # Fallback to TrimmedMean if FLTrust prerequisites missing
-                self.layer3 = TrimmedMeanAggregator(
-                    trim_ratio=self.config['layer3_trim_ratio']
+                raise ValueError(
+                    "FLTrust selected but missing required config: "
+                    "'fltrust_server_dataset' and/or 'fltrust_server_model'"
                 )
         else:  # Default to Trimmed Mean
             self.layer3 = TrimmedMeanAggregator(
@@ -187,9 +187,10 @@ class DefenseCoordinator:
             cleaned_updates = [
                 u for i, u in enumerate(updates) if i not in all_anomalies
             ]
-            # Safety: keep at least 1 update (never empty-aggregate)
             if len(cleaned_updates) < 1:
-                cleaned_updates = updates  # fallback to full set
+                raise RuntimeError(
+                    "All updates were flagged by defense layers; refusing unsafe fallback aggregation"
+                )
         else:
             cleaned_updates = updates
         results['cleaned_updates'] = cleaned_updates

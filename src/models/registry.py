@@ -140,8 +140,10 @@ try:
     from src.models.resnet import CIFAR10ResNet18
     _MODEL_REGISTRY['resnet18'] = CIFAR10ResNet18
     _MODEL_REGISTRY['cifar10_resnet18'] = CIFAR10ResNet18
-except ImportError:
-    pass  # torchvision may not be installed
+except ImportError as exc:
+    raise ImportError(
+        "CIFAR10ResNet18 dependency missing. Install required torchvision dependencies."
+    ) from exc
 
 
 def create_model(model_type: str, **kwargs) -> nn.Module:

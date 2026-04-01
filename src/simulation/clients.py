@@ -64,7 +64,7 @@ class ByzantineClientSimulator:
         if self.data_loader is not None:
             self.client.train_local(self.data_loader, num_epochs)
         else:
-            self.client.train_local(None, 0)  # Legacy fallback
+            raise ValueError("ByzantineClientSimulator requires a non-null data_loader in strict mode")
         
         # Apply attack
         self.client.attack(self.attack_type)
